@@ -156,10 +156,31 @@ def call_anthropic(system, user_text, temperature=None, max_tokens=1500):
                  "anthropic-version": "2023-06-01"})
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            return "".join(b.get("text", "") for b in
-                           json.loads(resp.read()).get("content", []))
+            data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         raise SystemExit(f"API error {e.code}: {e.read().decode()[:400]}")
+
+    text = "".join(b.get("text", "") for b in data.get("content", []))
+
+    # A RESPONSE THAT HIT THE CAP IS NOT A MALFORMED RESPONSE, and reporting
+    # them the same way hides which one happened. A truncated reply arrives as
+    # a JSON object cut off mid-object; parse_json returns None; the run then
+    # prints "unparseable JSON" and the reader concludes the model cannot
+    # follow the format. It could, and it did - it ran out of room.
+    #
+    # The two need opposite responses: raise max_tokens, or fix the prompt.
+    # This is the same error the Analog Engine recorded as #7, where a 2,000
+    # token cap silently truncated red-team output into invalid JSON and the
+    # determinism harness was what caught it.
+    if data.get("stop_reason") == "max_tokens":
+        raise SystemExit(
+            f"The model hit the {max_tokens}-token cap and the reply is cut "
+            f"off mid-sentence.\n"
+            f"  This is NOT a formatting failure - the JSON is truncated, not "
+            f"malformed.\n"
+            f"  Raise max_tokens for this call, or shorten the input.\n"
+            f"  Last 120 characters received: ...{text[-120:]}")
+    return text
 
 
 def parse_json(raw):
@@ -232,9 +253,31 @@ def cluster_drivers(first, pods, temperature, sleep, runs):
     is a question with a defensible answer - instead of guessing a shared
     vocabulary it has no way to coordinate on.
     """
+    # A FAILED EXTRACTION MUST NOT VOTE. The earlier version wrote
+    # `d = first[p] or {}` and sent the pod on regardless, which rendered as
+    # "driver: ? | mechanism: ? | direction: ? | horizon: ? quarters". Two
+    # failures become two IDENTICAL rows, and a model asked to group managers
+    # by shared cause has every reason to put them together - so a pair of
+    # parse errors manufactures a crowding alert. A false positive produced by
+    # an error path is the worst kind, because it arrives looking like a
+    # finding.
+    #
+    # Failed pods are dropped and named. The indices the model sees are indices
+    # into the SURVIVING list, so `kept` is returned to map them back.
+    kept = [p for p in pods if first.get(p)]
+    dropped = [p for p in pods if not first.get(p)]
+    if dropped:
+        print(f"  dropping {len(dropped)} pod(s) with no usable extraction "
+              f"from the clustering input: {', '.join(dropped)}")
+        print("  (a pod with no claim cannot be grouped by claim; leaving it in")
+        print("   would let two failures group with each other)")
+    if len(kept) < 2:
+        print("  fewer than two usable extractions - clustering skipped")
+        return [], ""
+
     lines = []
-    for i, p in enumerate(pods):
-        d = first[p] or {}
+    for i, p in enumerate(kept):
+        d = first[p]
         lines.append(
             f"{i}. driver: {d.get('driver_plain','?')} | mechanism: "
             f"{d.get('mechanism','?')} | direction: {d.get('direction','?')} | "
@@ -248,11 +291,28 @@ def cluster_drivers(first, pods, temperature, sleep, runs):
         out.append(obj)
         if r < runs - 1:
             time.sleep(sleep)
-    return out, user
+    return out, user, kept
 
 
-def assignment(obj, n):
-    """-> {pod_index: group_id}, or None."""
+def assignment(obj, kept):
+    """-> {pod_name: set(group_ids)}, or None.
+
+    Keyed by NAME rather than index: the model is shown only the pods with a
+    usable extraction, so its index 3 is the fourth SURVIVOR, not the fourth
+    pod. `kept` maps back. An index-keyed dict would misalign silently the
+    moment one extraction failed.
+
+    ONE LABEL PER POD WAS WRONG AND SILENTLY SO. Nothing in the clustering
+    prompt forbids a manager from appearing in two groups, and a manager
+    genuinely can be running two bets. The earlier version wrote
+    `m[i] = gid`, so a second group containing pod i overwrote the first -
+    and the group table renders the model's groups directly while the pair
+    logic read this dict, so one artifact answered the same question two
+    ways. That is the same failure as pods4 and pods5 ranking eras by
+    different definitions.
+
+    Membership is a set. Two pods share a bet when their sets intersect.
+    """
     if not obj:
         return None
     m = {}
@@ -263,12 +323,12 @@ def assignment(obj, n):
                 i = int(i)
             except (TypeError, ValueError):
                 continue
-            if 0 <= i < n:
-                m[i] = gid
+            if 0 <= i < len(kept):
+                m.setdefault(kept[i], set()).add(gid)
     return m
 
 
-def partition_agreement(assigns, n):
+def partition_agreement(assigns, names):
     """Share of PAIRS placed together-or-apart identically across runs.
 
     Comparing group LABELS across runs would repeat the original mistake -
@@ -281,9 +341,12 @@ def partition_agreement(assigns, n):
         return None, 0
     same = 0
     tot = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            vals = [(a.get(i) is not None and a.get(i) == a.get(j)) for a in good]
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            p, q = names[i], names[j]
+            # "together" now means the two pods share at least one group.
+            # Still a closed binary decision per pair, so still comparable.
+            vals = [bool(a.get(p) and a.get(q) and (a[p] & a[q])) for a in good]
             tot += 1
             same += len(set(vals)) == 1
     return same / tot, tot
@@ -301,7 +364,9 @@ def thesis_overlap(a, b, ga=None, gb=None):
     """
     if not a or not b:
         return 0.0
-    same_driver = (ga is not None and ga == gb)
+    # ga and gb are SETS of group ids. Two pods share a driver when the sets
+    # intersect, not when a single label matches.
+    same_driver = bool(ga and gb and (set(ga) & set(gb)))
     same_dir = a.get("direction") == b.get("direction")
     if not same_driver:
         return 0.0
@@ -343,6 +408,12 @@ def main():
                     help="reuse outputs/thesis_extract.json")
     ap.add_argument("--sleep", type=float, default=0.8)
     ap.add_argument("--min-overlap", type=float, default=0.5)
+    ap.add_argument("--as-of", default=None,
+                    help="date the books are as of, YYYY-MM-DD. Relative timing "
+                         "in a thesis resolves forward from it. Defaults to the "
+                         "last era in pods_holdings.csv. Without an anchor the "
+                         "extraction guesses the year and the catalyst calendar "
+                         "stops being reproducible.")
     a = ap.parse_args()
 
     truth = pd.read_csv(os.path.join(a.indir, "pods_truth.csv"))
@@ -353,6 +424,33 @@ def main():
              for p in pods}
     os.makedirs("outputs", exist_ok=True)
 
+    # ------------------------------------------------- the timing anchor
+    # A MEMO CARRIES ITS YEAR ON THE LETTERHEAD, NOT IN THE SENTENCE. A thesis
+    # saying "December" or "late January" is unambiguous to whoever wrote it
+    # and ambiguous to anything reading it afterwards, so with no reference
+    # date the extraction has to guess the year - and guesses differently on
+    # different runs. Two runs over identical theses in the browser produced
+    # different calendars, one placing catalysts BEFORE the books existed,
+    # while the pairs and the grouping stayed stable across those same runs.
+    # Only the calendar drifted, which is why it survived several
+    # reproducibility checks.
+    #
+    # The anchor is the fix; a firmer instruction is not. The prompt already
+    # forbids guessing a date from vague language, and "December" does not
+    # read as vague.
+    as_of = a.as_of
+    if as_of is None:
+        _h = pd.read_csv(os.path.join(a.indir, "pods_holdings.csv"),
+                         usecols=["era"])
+        as_of = str(sorted(_h["era"].unique())[-1])[:10]
+    date_note = (
+        f"These positions are as of {as_of}. Relative timing in the document "
+        f'("December", "next quarter", "late January") is relative to that '
+        f"date and resolves forward from it. If a month is named with no year, "
+        f"take the next occurrence of it after {as_of}. If the timing is "
+        f"genuinely vague, return null rather than choosing a date.\n\n---\n\n")
+    print(f"as of      : {as_of}  (catalyst dates resolve forward from this)")
+
     if a.dry_run:
         print("=" * 72)
         print("SYSTEM")
@@ -361,7 +459,7 @@ def main():
         print("\n" + "=" * 72)
         print(f"USER  ({pods[0]})")
         print("=" * 72)
-        print(texts[pods[0]])
+        print(date_note + texts[pods[0]])
         return
 
     # ------------------------------------------------------- extraction
@@ -380,7 +478,7 @@ def main():
         for p in pods:
             runs_by_pod[p] = []
             for r in range(a.runs):
-                raw = call_anthropic(SYSTEM, texts[p], a.temperature)
+                raw = call_anthropic(SYSTEM, date_note + texts[p], a.temperature)
                 obj = parse_json(raw)
                 if obj is None:
                     bad += 1
@@ -413,15 +511,31 @@ def main():
     if a.offline and os.path.exists(cstore):
         cl = json.load(open(cstore))
         cruns, cuser = cl["runs"], cl["prompt"]
+        # older caches predate `kept`; fall back to every pod, which is what
+        # they were written under
+        ckept = cl.get("kept") or list(pods)
     else:
         print("\n  grouping by shared driver ...", flush=True)
-        cruns, cuser = cluster_drivers(first, pods, a.temperature, a.sleep,
-                                       max(2, a.runs))
-        json.dump({"runs": cruns, "prompt": cuser}, open(cstore, "w"), indent=1)
+        cruns, cuser, ckept = cluster_drivers(first, pods, a.temperature,
+                                              a.sleep, max(2, a.runs))
+        json.dump({"runs": cruns, "prompt": cuser, "kept": ckept},
+                  open(cstore, "w"), indent=1)
 
-    assigns = [assignment(o, len(pods)) for o in cruns]
-    agree, npair = partition_agreement(assigns, len(pods))
+    assigns = [assignment(o, ckept) for o in cruns]
+    agree, npair = partition_agreement(assigns, ckept)
     grp = assigns[0] or {}
+
+    multi = sorted(p for p, g in grp.items() if len(g) > 1)
+    if multi:
+        print(f"\n  {len(multi)} manager(s) appear in more than one group: "
+              f"{', '.join(multi)}")
+        print("  Nothing forbids it and a manager can be running two bets, so")
+        print("  membership is a set and two pods share a bet when their sets")
+        print("  intersect. An earlier version kept one label per pod, which")
+        print("  silently dropped every group but the last.")
+    if len(ckept) < len(pods):
+        print(f"\n  the grouping ran on {len(ckept)} of {len(pods)} pods - "
+              f"read the partition as partial, not complete")
 
     print("\n" + "=" * 74)
     print("IS THE GROUPING REPRODUCIBLE?")
@@ -443,11 +557,11 @@ def main():
     print("=" * 74)
     g0 = (cruns[0] or {}).get("groups", [])
     for g in sorted(g0, key=lambda x: -len(x.get("members", []))):
-        mem = [pods[i] for i in g.get("members", []) if i < len(pods)]
+        mem = [ckept[i] for i in g.get("members", []) if i < len(ckept)]
         if not mem:
             continue
         tag = Counter(ty.get(p, "?") for p in mem)
-        opp = [pods[i] for i in (g.get("opposed") or []) if i < len(pods)]
+        opp = [ckept[i] for i in (g.get("opposed") or []) if i < len(ckept)]
         print(f"  {g.get('plain','?')[:58]:<60} {len(mem):>2} pods  "
               f"{', '.join(f'{k}:{v}' for k, v in tag.items())}"
               + (f"   opposed: {', '.join(opp)}" if opp else ""))
@@ -462,7 +576,7 @@ def main():
     for i in range(len(pods)):
         for j in range(i + 1, len(pods)):
             p, q = pods[i], pods[j]
-            ov = thesis_overlap(first[p], first[q], grp.get(i), grp.get(j))
+            ov = thesis_overlap(first[p], first[q], grp.get(p), grp.get(q))
             A, B = books.get(p, set()), books.get(q, set())
             jac = len(A & B) / len(A | B) if A and B else 0.0
             rows.append({"a": p, "b": q, "thesis_overlap": ov,

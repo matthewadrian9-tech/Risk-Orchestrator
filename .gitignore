@@ -8,3 +8,5 @@ __pycache__/
 *.key
 .env
 secrets.*
+/demo/
+/docs/data/demo_returns.json

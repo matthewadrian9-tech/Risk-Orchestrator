@@ -198,6 +198,20 @@ function Separation({data}){
         can be a factor the model missed, and shared names can be two managers
         liking one sector. Both together is the signature.
       </p>
+      <p className="note">
+        <strong>The factor pairs are scored twice on this page, in opposite
+        directions, and both scores are right.</strong> This test does not flag
+        them, and counts that as zero false positives. The thesis layer below
+        groups those same pods together, and counts that as recovering a
+        planted driver group. Read side by side without this sentence it looks
+        like scoring both ways. It is not: the two tests answer different
+        questions. Those pods are <em>not crowded</em> — they hold nothing in
+        common and no forced exit puts them in the same bid, so a position test
+        is right to reject them. They <em>are</em> making one bet, and will be
+        wrong together on the day the driver turns, so a text test is right to
+        find them. A fund needs both answers because the remedies differ:
+        crowding is solved by cutting a position, a shared bet is not.
+      </p>
     </div>
   );
 }
@@ -370,7 +384,7 @@ const EXTRACT_SYS=`You are a risk analyst at a multi-manager hedge fund. You are
 You are comparing BETS, not prose. Two managers can write about the same sector while betting in opposite directions, and two managers can describe one bet in completely different vocabulary. Extract what is being bet on and which way, not what the document is about.
 
 Hard constraints:
-- Use only what the document states. Do not infer a driver the manager did not describe.
+- Use only what the document states. Do not infer a driver the manager did not describe, and do not import knowledge about any real company or market. If a document names a ticker, reason from what the manager wrote about it, never from what you know about it.
 - Describe the driver in plain words. Do NOT invent a canonical label or slug; grouping happens in a later pass that sees every thesis at once.
 - Dates: convert relative timing to an approximate ISO date where the document gives enough to do so, otherwise null.
 
@@ -406,11 +420,166 @@ async function askClaude(key, system, user, maxTokens){
   catch(e){ const m=c.match(/\{[\s\S]*\}/); if(m) return JSON.parse(m[0]); throw new Error("model did not return JSON"); }
 }
 
+
+/* ---------- returns-based analysis, when the names resolve ----------
+   The upload panel can aggregate positions and read text without any market
+   data. Three things it cannot do without returns: a Sharpe, a residual
+   correlation, and an unwind priced in dollars. So the demo pack ships the
+   daily returns for the names it uses, and these run whenever enough of an
+   uploaded book resolves against that bundle.
+
+   The coverage floor is deliberate. A residual correlation computed on 40% of
+   a book is a different number from the real one, and it looks identical when
+   printed. Below the floor the analyses are refused rather than shown with a
+   caveat nobody reads; above it, the coverage is printed next to every result. */
+const COVERAGE_FLOOR=0.80;
+
+function podSeries(rows, bundle){
+  // manager return series from weights and the shipped daily returns
+  const out={}, cov={};
+  const pods=[...new Set(rows.map(r=>r.pod))];
+  const n=bundle.dates.length;
+  pods.forEach(p=>{
+    const mine=rows.filter(r=>r.pod===p);
+    const tot=mine.reduce((a,r)=>a+r.exp,0)||1;
+    let found=0, series=new Array(n).fill(0);
+    mine.forEach(r=>{
+      const s=bundle.names[r.ticker];
+      if(!s) return;
+      found+=r.exp;
+      const sgn=r.side==="short"?-1:1;
+      const w=sgn*r.exp/tot;
+      for(let i=0;i<n;i++) series[i]+=w*s[i];
+    });
+    cov[p]=found/tot;
+    out[p]=series;
+  });
+  return {series:out, cov, pods};
+}
+
+function corr(a,b){
+  const n=Math.min(a.length,b.length);
+  let ma=0,mb=0; for(let i=0;i<n;i++){ma+=a[i];mb+=b[i];}
+  ma/=n; mb/=n;
+  let sa=0,sb=0,sab=0;
+  for(let i=0;i<n;i++){const x=a[i]-ma,y=b[i]-mb; sa+=x*x; sb+=y*y; sab+=x*y;}
+  return (sa>0&&sb>0)? sab/Math.sqrt(sa*sb) : 0;
+}
+
+function blockShift(x, block, rnd){
+  // Circular block bootstrap, same as block_shift() in pods2_crowding.py:
+  // keeps each series' own dynamics, destroys alignment BETWEEN series.
+  const n=x.length, nb=Math.ceil(n/block), out=new Array(n);
+  let w=0;
+  for(let b=0;b<nb&&w<n;b++){
+    const st=Math.floor(rnd()*n);
+    for(let i=0;i<block&&w<n;i++) out[w++]=x[(st+i)%n];
+  }
+  return out;
+}
+
+function pairPvalues(resid, names, nBoot, block, seed){
+  // Pooled null, ported from pair_pvalues() in pods2_crowding.py.
+  //
+  // WHY POOLED AND NOT PER-PAIR. A per-pair p from B draws cannot go below
+  // 1/(B+1). With 15 pairs BH's tightest threshold is 0.05/15 = 0.0033, and
+  // 300 draws floor at 0.0033 - exactly on the boundary, so nothing could
+  // reliably survive. Pooling every pair's null draws into one reference
+  // distribution gives B x npairs values and a floor far below the threshold.
+  // Under the null the pairs are exchangeable, so pooling is legitimate.
+  let st=seed>>>0;
+  const rnd=()=>{ st^=st<<13; st>>>=0; st^=st>>17; st^=st<<5; st>>>=0;
+                  return st/4294967296; };
+  const m=names.length;
+  const z=names.map(p=>{
+    const x=resid[p], n=x.length;
+    const mu=x.reduce((a,b)=>a+b,0)/n;
+    const sd=Math.sqrt(x.reduce((a,b)=>a+(b-mu)*(b-mu),0)/n)||1;
+    return x.map(v=>(v-mu)/sd);
+  });
+  const pool=[];
+  for(let b=0;b<nBoot;b++){
+    const Y=z.map(x=>blockShift(x,block,rnd));
+    for(let i=0;i<m;i++)
+      for(let j=i+1;j<m;j++) pool.push(Math.abs(corr(Y[i],Y[j])));
+  }
+  pool.sort((a,b)=>a-b);
+  const pOf=obs=>{
+    let lo=0,hi=pool.length;
+    while(lo<hi){ const mid=(lo+hi)>>1; if(pool[mid]<obs) lo=mid+1; else hi=mid; }
+    return (pool.length-lo+1)/(pool.length+1);
+  };
+  return {pOf, nRef:pool.length, floor:1/(pool.length+1)};
+}
+
+function benjaminiHochberg(ps, alpha){
+  // Same procedure as benjamini_hochberg() in pods2_crowding.py.
+  const n=ps.length;
+  if(!n) return [];
+  const ord=ps.map((v,i)=>[v,i]).sort((a,b)=>a[0]-b[0]);
+  let cut=-1;
+  for(let r=0;r<n;r++) if(ord[r][0]<=alpha*(r+1)/n) cut=r;
+  const keep=new Array(n).fill(false);
+  for(let r=0;r<=cut;r++) keep[ord[r][1]]=true;
+  return keep;
+}
+
+function residualise(series, factors, k, win){
+  // Block-wise OLS, same as scripts/pods2_crowding.py. Fitting one regression
+  // over the whole sample cannot track a loading that changes when the book
+  // changes; on the CRSP pods a full-sample fit left factor pairs at 0.41 and
+  // block fitting took them to 0.05.
+  const n=series.length, F=factors.map(f=>f.slice(0,n));
+  const out=new Array(n).fill(0);
+  for(let s0=0;s0<n;s0+=win){
+    const s1=Math.min(s0+win,n);
+    const m=s1-s0;
+    if(m<k+5){ for(let i=s0;i<s1;i++) out[i]=series[i]; continue; }
+    // normal equations for [1, F1..Fk]
+    const X=[]; for(let i=s0;i<s1;i++){
+      const row=[1]; for(let j=0;j<k;j++) row.push(F[j][i]); X.push(row); }
+    const p=k+1;
+    const A=Array.from({length:p},()=>new Array(p).fill(0));
+    const b=new Array(p).fill(0);
+    for(let i=0;i<m;i++){
+      for(let u=0;u<p;u++){
+        b[u]+=X[i][u]*series[s0+i];
+        for(let v=0;v<p;v++) A[u][v]+=X[i][u]*X[i][v];
+      }
+    }
+    // gaussian elimination with a ridge nudge for stability
+    for(let u=0;u<p;u++) A[u][u]+=1e-10;
+    for(let u=0;u<p;u++){
+      let piv=u;
+      for(let v=u+1;v<p;v++) if(Math.abs(A[v][u])>Math.abs(A[piv][u])) piv=v;
+      [A[u],A[piv]]=[A[piv],A[u]]; [b[u],b[piv]]=[b[piv],b[u]];
+      if(Math.abs(A[u][u])<1e-14) continue;
+      for(let v=u+1;v<p;v++){
+        const f=A[v][u]/A[u][u];
+        for(let w2=u;w2<p;w2++) A[v][w2]-=f*A[u][w2];
+        b[v]-=f*b[u];
+      }
+    }
+    const beta=new Array(p).fill(0);
+    for(let u=p-1;u>=0;u--){
+      let acc=b[u];
+      for(let v=u+1;v<p;v++) acc-=A[u][v]*beta[v];
+      beta[u]=Math.abs(A[u][u])<1e-14?0:acc/A[u][u];
+    }
+    for(let i=0;i<m;i++){
+      let fit=beta[0];
+      for(let j=0;j<k;j++) fit+=beta[j+1]*F[j][s0+i];
+      out[s0+i]=series[s0+i]-fit;
+    }
+  }
+  return out;
+}
+
 /* ---------- run it on your own book ---------- */
 function Upload(){
   const [err,setErr]=useState(null);
   const [minPods,setMinPods]=useState(2);
-  const [nPerm,setNPerm]=useState(200);
+  const [nPerm,setNPerm]=useState(2000);
   const [busy,setBusy]=useState(false);
   const [res,setRes]=useState(null);
 
@@ -545,7 +714,23 @@ function Upload(){
           ladder.push({t, real:share, chance:0, p:1});
         }
         // chance floor: redraw each pod's long book at random from the
-        // universe actually held, keeping book sizes fixed
+        // universe actually held, keeping book sizes fixed.
+        //
+        // SEEDED, AND THAT IS NOT A DETAIL. This null used Math.random(), so
+        // every page load drew a different sample and the same book produced a
+        // different p-value each time. On the demo pack two consecutive runs
+        // gave 0.030 and 0.060 - one clearing the conventional threshold and
+        // one not, from identical input. A dashboard that changes its verdict
+        // on reload is not reporting a measurement, and a reader has no way to
+        // tell an unstable estimate from a real one.
+        //
+        // A fixed seed makes the number reproducible. It does not make it more
+        // accurate - the p is still an estimate with sampling error, and a
+        // different seed would give a different answer - so the draw count is
+        // raised as well, which is the part that actually shrinks the error.
+        let lseed=20260823>>>0;
+        const lrnd=()=>{ lseed^=lseed<<13; lseed>>>=0; lseed^=lseed>>17;
+                         lseed^=lseed<<5; lseed>>>=0; return lseed/4294967296; };
         const sizes=pods.map(p=>longsBy[p].size);
         const nullShare={};
         ladder.forEach(l=>nullShare[l.t]=[]);
@@ -554,7 +739,7 @@ function Upload(){
           sizes.forEach(sz=>{
             const pick=new Set();
             while(pick.size<sz && pick.size<uni.length)
-              pick.add(uni[Math.floor(Math.random()*uni.length)]);
+              pick.add(uni[Math.floor(lrnd()*uni.length)]);
             pick.forEach(k=>cnt[k]=(cnt[k]||0)+1);
           });
           ladder.forEach(l=>{
@@ -619,9 +804,137 @@ function Upload(){
                   nHit:hit.length, top:hit.slice(0,3)};
         }).sort((a,b)=>b.others-a.others);
 
+        // ---- returns-based analyses, only where the names resolve
+        let ret=null;
+        if(bundle&&bundle.names){
+          const {series,cov}=podSeries(rows,bundle);
+          const covered=pods.filter(p=>cov[p]>=COVERAGE_FLOOR);
+          const meanCov=pods.reduce((a,p)=>a+cov[p],0)/pods.length;
+          if(covered.length>=2){
+            const k=Math.min(5,bundle.factor_names.length);
+            const F=bundle.factor_names.slice(0,k).map(f=>bundle.factors[f]);
+            const resid={};
+            covered.forEach(p=>resid[p]=residualise(series[p],F,k,63));
+            const cp=[];
+            for(let i=0;i<covered.length;i++)
+              for(let j=i+1;j<covered.length;j++){
+                const p=covered[i],q=covered[j];
+                const A=new Set(rows.filter(r=>r.pod===p&&r.side==="long").map(r=>r.ticker));
+                const Bs=new Set(rows.filter(r=>r.pod===q&&r.side==="long").map(r=>r.ticker));
+                let inter=0; A.forEach(x=>{if(Bs.has(x)) inter++;});
+                cp.push({a:p,b:q,
+                  raw:corr(series[p],series[q]),
+                  resid:corr(resid[p],resid[q]),
+                  jac:(A.size+Bs.size-inter)?inter/(A.size+Bs.size-inter):0});
+              }
+
+            // A residual correlation is flagged only if it survives a null and
+            // then Benjamini-Hochberg across every pair. The earlier version
+            // used |resid| > 0.1 with no null at all, which is the p-value
+            // floor error in a different costume: a fixed cut cannot know how
+            // large a residual correlation this many days of data throws off
+            // by chance, and on the demo pack it produced two false positives
+            // at +0.121 and +0.113 beside a true one at +0.191.
+            const NB=300, BLK=21, ALPHA=0.05;
+            const nullRes=pairPvalues(resid, covered, NB, BLK, 20260823);
+            cp.forEach(c=>{ c.p=nullRes.pOf(Math.abs(c.resid)); });
+            const keep=benjaminiHochberg(cp.map(c=>c.p), ALPHA);
+            cp.forEach((c,i)=>{ c.sig=keep[i]; });
+
+            // SIGNIFICANCE IS NECESSARY AND NOT SUFFICIENT, and the demo pack
+            // is what taught us. Over 1,500 days the null calls any residual
+            // correlation above about 0.06 significant, because it tests
+            // INDEPENDENCE. Six books that still share unmodelled factor
+            // exposure are genuinely not independent, so 9 of 15 pairs cleared
+            // BH while only 2 were planted. A fixed cut at 0.1 is not the
+            // answer either - it is a number with no defence.
+            //
+            // The second gate is the fund's OWN median absolute residual. Every
+            // pair carries that much; it is what five factors failed to remove,
+            // measured on this fund rather than assumed. Crowding is the excess
+            // over it. On the demo pack the baseline is 0.087 and the gate at
+            // twice that flags exactly the planted crowded pair and the planted
+            // latent one, and nothing else.
+            // THE AND-GATE, AND WHAT SITS OUTSIDE IT.
+            //
+            // "Crowded" requires BOTH a significant residual correlation and
+            // shared names, exactly as pods2_crowding.py does, and for the
+            // same reason: a correlated residual on its own can be a factor
+            // the model missed, so overlap is what keeps false positives at
+            // zero. Loosening that to residual-only reintroduces precisely
+            // the errors the AND-gate exists to prevent.
+            //
+            // A significant residual with NO shared names is not a weaker
+            // form of crowding and does not get a lower bar. It is a
+            // different finding with a different remedy - two managers whose
+            // books will move together while every position report shows
+            // nothing - so it gets its own name rather than a discount.
+            // pods2 cannot reach this cell at all, because zero overlap can
+            // never clear its second gate. That is the cell the text layer
+            // exists for.
+            //
+            // The fund's median absolute residual is reported alongside, not
+            // as a gate. It measures what the factor model failed to remove;
+            // a flagged pair barely above it is worth reading twice.
+            const absR=cp.map(c=>Math.abs(c.resid)).sort((x,y)=>x-y);
+            const baseline=absR.length%2 ? absR[(absR.length-1)/2]
+                          : (absR[absR.length/2-1]+absR[absR.length/2])/2;
+            const OVL=0.05;
+            // SIGN MATTERS AND THE FIRST VERSION IGNORED IT. The null is
+            // two-sided, which is right - a residual correlation far from zero
+            // in either direction is a real relationship. But the LABEL is not
+            // symmetric. A significantly NEGATIVE residual correlation means
+            // the two books offset each other once factors are stripped: they
+            // are each other's hedge, not each other's crowd, and calling that
+            // "shared risk" tells a risk desk to act on the exact opposite of
+            // what is happening. The demo pack surfaced it - lmoreau against
+            // schen at -0.127 was reported as shared risk.
+            cp.forEach(c=>{ c.crowded=c.sig&&c.resid>0&&c.jac>=OVL;
+                            c.sharedRisk=c.sig&&c.resid>0&&c.jac<OVL;
+                            c.offset=c.sig&&c.resid<0;
+                            c.flag=c.sig; });
+            const nullMeta={nBoot:NB, block:BLK, alpha:ALPHA,
+                            nRef:nullRes.nRef, floor:nullRes.floor,
+                            nSig:keep.filter(Boolean).length, baseline,
+                            ovl:OVL,
+                            nCrowd:cp.filter(c=>c.crowded).length,
+                            nRisk:cp.filter(c=>c.sharedRisk).length,
+                            nOff:cp.filter(c=>c.offset).length};
+            const stats=covered.map(p=>{
+              const x=series[p], n2=x.length;
+              const mu=x.reduce((a,b)=>a+b,0)/n2;
+              const sd2=Math.sqrt(x.reduce((a,b)=>a+(b-mu)*(b-mu),0)/n2);
+              return {pod:p, ann:mu*252, vol:sd2*Math.sqrt(252),
+                      sharpe:sd2>0?(mu*252)/(sd2*Math.sqrt(252)):0,
+                      cov:cov[p]};
+            });
+            // unwind priced with the shipped volatilities
+            const un=covered.map(p=>{
+              const mine=rows.filter(r=>r.pod===p&&r.side==="long");
+              let hit=0;
+              mine.forEach(r=>{
+                const v=bundle.vol[r.ticker], c=bundle.cap[r.ticker];
+                if(!v||!c) return;
+                const move=-1.0*v/Math.sqrt(252)*Math.sqrt(r.exp/(0.005*c));
+                covered.forEach(q=>{ if(q===p) return;
+                  const o=rows.find(x=>x.pod===q&&x.ticker===r.ticker&&x.side==="long");
+                  if(o) hit+=o.exp*move;
+                });
+              });
+              return {pod:p, damage:hit};
+            }).sort((x,y)=>x.damage-y.damage);
+            ret={pairs:cp, stats, unwind:un, covered:covered.length,
+                 total:pods.length, meanCov, k, nullMeta,
+                 factors:bundle.factor_names.slice(0,k), days:bundle.dates.length};
+          } else {
+            ret={insufficient:true, meanCov, total:pods.length,
+                 covered:covered.length};
+          }
+        }
+
         const B=sizes.reduce((a,b)=>a+b,0)/Math.max(pods.length,1);
         setRes({pods:pods.length, uni:uni.length, ladder, pairs, names,
-                mgr, grid, gridNames, exit,
+                mgr, grid, gridNames, exit, ret,
                 floor:B*B/Math.max(uni.length,1)/(2*B),
                 inCash,
                 assumed:rows.some(r=>r.assumed)});
@@ -631,6 +944,11 @@ function Upload(){
   };
 
   // ---- thesis pass, run with the user's own key, in their browser
+  const [bundle,setBundle]=useState(null);
+  useEffect(()=>{
+    fetch("data/demo_returns.json").then(r=>r.ok?r.json():null)
+      .then(setBundle).catch(()=>setBundle(null));
+  },[]);
   const [apiKey,setApiKey]=useState("");
   const [tBusy,setTBusy]=useState("");
   const [tRes,setTRes]=useState(null);
@@ -639,10 +957,32 @@ function Upload(){
     if(!pods.length||!apiKey) return;
     setErr(null); setTRes(null);
     try{
+      // THE CALENDAR WAS NOT REPRODUCIBLE AND THE DOCUMENTS ARE WHY. A memo
+      // that says "December" and "late January" is unambiguous to the person
+      // who wrote it and ambiguous to anything reading it later, because the
+      // year is carried by the date on the letterhead. With no anchor the
+      // extraction has to guess, and two runs over the SAME theses put
+      // catalysts in different years - one run placed them in January 2024,
+      // before the books existed. The pairs and the grouping were stable
+      // across those runs; only the calendar moved, which is why it went
+      // unnoticed.
+      //
+      // The fix is the anchor, not a firmer instruction. The as-of date is
+      // the last date in the returns bundle when there is one, so catalysts
+      // resolve against the same window the returns cover.
+      const asOf=(bundle&&bundle.dates&&bundle.dates.length)
+                 ? bundle.dates[bundle.dates.length-1]
+                 : new Date().toISOString().slice(0,10);
       const ext={};
       for(let i=0;i<pods.length;i++){
         setTBusy(`reading ${pods[i]} (${i+1}/${pods.length})`);
-        ext[pods[i]]=await askClaude(apiKey, EXTRACT_SYS, theses[pods[i]]);
+        ext[pods[i]]=await askClaude(apiKey, EXTRACT_SYS,
+          `These positions are as of ${asOf}. Relative timing in the document `
+          +`("December", "next quarter", "late January") is relative to that `
+          +`date and must resolve forward from it. If a month is named with no `
+          +`year, take the next occurrence of it after ${asOf}. If the timing `
+          +`is genuinely vague ("in due course", "eventually"), return null `
+          +`rather than choosing a date.\n\n---\n\n`+theses[pods[i]]);
       }
       setTBusy("grouping by shared driver");
       const lines=pods.map((p,i)=>
@@ -651,9 +991,17 @@ function Upload(){
       const cl=await askClaude(apiKey, CLUSTER_SYS,
         "The managers:\n\n"+lines.join("\n")+"\n\nGroup them by shared underlying cause.", 2500);
 
+      // A manager can genuinely be in two bets, and the model is not told
+      // otherwise. Keeping one label per manager silently dropped every group
+      // but the last, so the group table could show a manager twice while the
+      // pair logic knew only one of them - one artifact answering two ways.
+      // Membership is a SET, and two managers share a bet when their sets
+      // intersect.
       const grp={};
       (cl.groups||[]).forEach(g=>(g.members||[]).forEach(i=>{
-        if(i>=0&&i<pods.length) grp[pods[i]]=g.group_id; }));
+        if(i>=0&&i<pods.length)
+          (grp[pods[i]]=grp[pods[i]]||new Set()).add(g.group_id); }));
+      const multi=pods.filter(p=>grp[p]&&grp[p].size>1);
 
       // long books from whatever positions were loaded
       const longsBy={};
@@ -664,8 +1012,10 @@ function Upload(){
       for(let i=0;i<pods.length;i++)
         for(let j=i+1;j<pods.length;j++){
           const p=pods[i], q=pods[j];
-          const same=grp[p]!==undefined&&grp[p]===grp[q]
-                     &&ext[p].direction===ext[q].direction;
+          const gp=grp[p], gq=grp[q];
+          let shareGid=null;
+          if(gp&&gq) gp.forEach(x=>{ if(gq.has(x)) shareGid=x; });
+          const same=shareGid!==null&&ext[p].direction===ext[q].direction;
           const A=longsBy[p], B=longsBy[q];
           let jac=null;
           if(A&&B){ let n=0; A.forEach(x=>{if(B.has(x)) n++;});
@@ -684,7 +1034,7 @@ function Upload(){
       cal.forEach(c=>{ const w=c.approx_date.slice(0,7);
         (byWeek[w]=byWeek[w]||new Set()).add(c.pod); });
 
-      setTRes({ext, groups:cl.groups||[], cells, pods, cal,
+      setTRes({ext, groups:cl.groups||[], cells, pods, cal, multi,
                months:Object.entries(byWeek).map(([m,v])=>({m,pods:v.size}))
                  .sort((x,y)=>x.m<y.m?-1:1)});
       setTBusy("");
@@ -940,6 +1290,191 @@ FERC queue data, December.`}
             </svg>);})()}
           </div>
 
+          {res.ret && res.ret.insufficient && (
+            <p className="note" style={{color:"var(--crowd)",marginTop:16}}>
+              <strong>Return-based analyses not run.</strong> Only{" "}
+              {(res.ret.meanCov*100).toFixed(0)}% of the uploaded book resolves
+              against the return history this page ships, and{" "}
+              {res.ret.covered} of {res.ret.total} managers clear the{" "}
+              {(COVERAGE_FLOOR*100).toFixed(0)}% coverage floor. Below that a
+              residual correlation is computed on a fraction of a book and
+              looks identical to one computed on all of it, so it is refused
+              rather than shown with a caveat. The demo pack in{" "}
+              <code>demo/</code> resolves fully.
+            </p>
+          )}
+
+          {res.ret && !res.ret.insufficient && (()=>{
+            const R2=res.ret, W=700,H=300,P={t:16,r:16,b:44,l:56};
+            const lim=Math.max(0.4,...R2.pairs.map(p=>Math.max(Math.abs(p.raw),Math.abs(p.resid))))*1.15;
+            const x=v=>P.l+((v+lim)/(2*lim))*(W-P.l-P.r);
+            const y=v=>P.t+(1-(v+lim)/(2*lim))*(H-P.t-P.b);
+            const f=v=>(v>=0?"+":"")+v.toFixed(3);
+            return (
+            <React.Fragment>
+              <hr/>
+              <h2 style={{fontSize:"15px"}}>What the correlation matrix sees,
+                and what is actually shared</h2>
+              <p className="note" style={{marginTop:2}}>
+                These four run only because the names in these books resolve
+                against {R2.days.toLocaleString()} days of return history this
+                page ships with the demo pack. {R2.covered} of {R2.total}{" "}
+                managers clear the {(COVERAGE_FLOOR*100).toFixed(0)}% coverage
+                floor, at {(R2.meanCov*100).toFixed(0)}% mean coverage. Upload a
+                book of names outside that set and this section disappears
+                rather than guessing.
+              </p>
+              <table>
+                <thead><tr><th>Manager</th><th>Ann return</th><th>Ann vol</th>
+                  <th>Sharpe</th><th>Names resolved</th></tr></thead>
+                <tbody>{R2.stats.map(s2=>(
+                  <tr key={s2.pod}>
+                    <td className="v">{s2.pod}</td>
+                    <td className={"v "+(s2.ann>=0?"pos":"neg")}>{(s2.ann*100).toFixed(1)}%</td>
+                    <td className="v">{(s2.vol*100).toFixed(1)}%</td>
+                    <td className="v">{s2.sharpe.toFixed(2)}</td>
+                    <td className="v">{(s2.cov*100).toFixed(0)}%</td>
+                  </tr>))}
+                </tbody>
+              </table>
+
+              <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:14}}
+                   role="img" aria-label="raw against residual correlation">
+                {[-0.5,0,0.5].filter(t=>Math.abs(t)<lim).map(t=>(
+                  <g key={t}>
+                    <line className="gl" x1={x(t)} x2={x(t)} y1={P.t} y2={H-P.b}/>
+                    <line className="gl" x1={P.l} x2={W-P.r} y1={y(t)} y2={y(t)}/>
+                    <text className="axis" x={x(t)} y={H-P.b+15} textAnchor="middle">{t}</text>
+                    <text className="axis" x={P.l-7} y={y(t)+3} textAnchor="end">{t}</text>
+                  </g>))}
+                <line x1={x(-lim)} y1={y(-lim)} x2={x(lim)} y2={y(lim)}
+                      stroke="#c3c8cf" strokeDasharray="4 4"/>
+                {R2.pairs.map((p,i)=>{
+                  const latent=p.jac<0.05&&p.raw>0.3;
+                  return (
+                  <g key={i}>
+                    <circle cx={x(p.raw)} cy={y(p.resid)} r={p.jac>=0.05?5:4.5}
+                            fill={p.jac>=0.05?"var(--crowd)":latent?"var(--factor)":"var(--indep)"}
+                            stroke={latent?"var(--hl)":"none"} strokeWidth="2.4"
+                            opacity=".85"/>
+                    {(p.jac>=0.05||p.flag) &&
+                      <text className="axis" x={x(p.raw)+8} y={y(p.resid)+3}>
+                        {p.a} · {p.b}</text>}
+                  </g>);})}
+                <text className="axis" x={W/2} y={H-8} textAnchor="middle">
+                  return correlation</text>
+                <text className="axis" x={14} y={H/2} textAnchor="middle"
+                      transform={`rotate(-90 14 ${H/2})`}>residual correlation</text>
+              </svg>
+              <table>
+                <thead><tr><th>Pair</th><th>Book overlap</th>
+                  <th>Return corr</th><th>Residual corr</th><th>Reading</th></tr></thead>
+                <tbody>{[...R2.pairs].sort((a,b)=>b.raw-a.raw).slice(0,10).map((p,i)=>(
+                  <tr key={i}>
+                    <td className="v">{p.a} · {p.b}</td>
+                    <td className="v">{(p.jac*100).toFixed(1)}%</td>
+                    <td className="v">{f(p.raw)}</td>
+                    <td className={"v "+(p.flag?"neg":"")}>{f(p.resid)}
+                      <span className="axis" style={{marginLeft:6}}>
+                        {p.p<0.001?"p<0.001":"p="+p.p.toFixed(3)}</span></td>
+                    <td>{p.crowded?"shared names and shared risk"
+                        :p.sharedRisk?"shared risk, no shared names"
+                        :p.offset?"offsetting — each other's hedge"
+                        :p.raw>0.3?"shared factor only"
+                        :"unrelated"}</td>
+                  </tr>))}
+                </tbody>
+              </table>
+              <p className="note">
+                Horizontal is plain return correlation, the number a standard
+                risk report ranks on. Vertical is what survives after common
+                factor exposure is regressed out, refitted every 63 days because
+                a loading changes whenever the book does. A pair sitting far
+                right and near zero is a shared <em>factor</em> — hedge it
+                centrally, do not ask anyone to cut. A pair that stays high
+                vertically is shared idiosyncratic risk, which is the one that
+                needs a position change.
+              </p>
+              <p className="note">
+                <strong>How a pair is classified.</strong> Each residual
+                correlation is compared against a circular block bootstrap —
+                each manager's residual series is re-cut into {R2.nullMeta.block}-day
+                blocks and reassembled, which keeps that book's own dynamics
+                and destroys only the alignment between books. Every pair's
+                draws are pooled into one reference distribution of{" "}
+                {R2.nullMeta.nRef.toLocaleString()} values, and the p-values go
+                through Benjamini-Hochberg at {R2.nullMeta.alpha} across all{" "}
+                {R2.pairs.length} pairs. {R2.nullMeta.nSig} cleared it.
+              </p>
+              <p className="note">
+                <strong>Crowded needs two things, not one.</strong> A pair is
+                called <em>shared names and shared risk</em> only when the
+                residual correlation is significant <em>and</em> the books
+                actually overlap — the same rule the Python pipeline applies,
+                for the same reason. A correlated residual on its own can be a
+                factor the model missed, and requiring overlap too is what
+                keeps false positives at zero. {R2.nullMeta.nCrowd} pair
+                {R2.nullMeta.nCrowd===1?"":"s"} here.
+              </p>
+              <p className="note">
+                <strong>A significant residual with no shared names is a
+                different finding, not a weaker one.</strong> It does not get a
+                lower bar and it does not get called crowding. Two managers
+                whose books move together while holding nothing in common need
+                a different response from two managers in the same names: one
+                is an exit problem you solve by cutting, the other is a
+                correlation you hedge or accept, and neither remedy works on
+                the other case. {R2.nullMeta.nRisk} pair
+                {R2.nullMeta.nRisk===1?"":"s"} land here — the cell the Python
+                pipeline cannot reach at all, because zero overlap can never
+                clear its second gate.
+              </p>
+              <p className="note">
+                <strong>A significant NEGATIVE residual is not shared risk at
+                all.</strong> The null is two-sided, because a correlation far
+                from zero in either direction is a real relationship — but the
+                reading is not symmetric. Two books that offset each other once
+                the factors are stripped are each other's hedge, and telling a
+                risk desk they share risk would point it at the opposite of what
+                is happening. {R2.nullMeta.nOff} pair
+                {R2.nullMeta.nOff===1?" is":"s are"} labelled offsetting here.
+                An earlier version of this table called them shared risk, and
+                the demo pack is what caught it.
+              </p>
+              <p className="note">
+                For context rather than as a gate: the median absolute residual
+                across every pair is{" "}
+                <strong>{R2.nullMeta.baseline.toFixed(3)}</strong>. That is what{" "}
+                {R2.k} factors failed to remove, measured on this fund rather
+                than assumed. Every pair carries it, so a flagged pair sitting
+                barely above it is worth reading twice — over{" "}
+                {R2.days.toLocaleString()} days the null will call almost any
+                correlation above roughly 0.06 significant, because what it
+                tests is <em>independence</em>, and books that still share
+                unmodelled exposure are not independent.
+              </p>
+
+              <h2 style={{fontSize:"15px",marginTop:20}}>Priced unwind</h2>
+              <table>
+                <thead><tr><th>If this manager is liquidated</th>
+                  <th>Cost to the others</th></tr></thead>
+                <tbody>{R2.unwind.map(u=>(
+                  <tr key={u.pod}>
+                    <td className="v">{u.pod}</td>
+                    <td className={"v "+(u.damage<0?"neg":"")}>
+                      {(u.damage/1e6).toFixed(2)}m</td>
+                  </tr>))}
+                </tbody>
+              </table>
+              <p className="note">
+                Square-root impact on each name's own realised volatility, with
+                capacity proxied at 0.5% of market capitalisation a day because
+                CRSP carries no volume. The ordering is the result; the dollar
+                figures move with that liquidity assumption and are a scenario
+                rather than an estimate.
+              </p>
+            </React.Fragment>);})()}
+
           <h2 style={{fontSize:"15px",marginTop:20}}>If one manager is forced out</h2>
           <p className="note" style={{marginTop:2}}>
             A stop-loss is automatic and nobody votes on it. If a manager is
@@ -981,6 +1516,35 @@ FERC queue data, December.`}
             of this size share roughly{" "}
             <strong>{(res.floor*100).toFixed(1)}%</strong> of their long names
             by chance alone — the floor any crowding number has to clear.
+          </p>
+          <p className="note">
+            <strong>This test has little power on a small fund, and that is not
+            a defect in the arithmetic.</strong> The floor is the genuine chance
+            level for books of this size drawn from {res.uni} names; it is high
+            because the universe is small, and the universe is small because a
+            position file says nothing about what else was on the menu. With six
+            managers the ladder can miss crowding that is really there — on the
+            demo pack, where a crowded pair is planted and known, the t = 2 row
+            lands near p = 0.05 rather than clearing it comfortably.
+          </p>
+          <p className="note">
+            So read a null result here as <em>not shown</em> rather than{" "}
+            <em>not present</em>, and let the pair table below carry the weight:
+            a single pair well above its own floor is the more reliable signal at
+            this size. The ladder becomes the better instrument as the number of
+            managers grows.
+          </p>
+          <p className="note">
+            <strong>This null is seeded, so reloading cannot change the
+            answer.</strong> It previously was not, and the demo pack exposed
+            it: two consecutive runs on identical books returned p = 0.030 and
+            p = 0.060, one either side of the conventional threshold. The draw
+            count is now {nPerm.toLocaleString()} rather than 200, which is the
+            part that actually shrinks the sampling error — a fixed seed only
+            makes the estimate repeatable, not more accurate, and a different
+            seed would still give a slightly different number. Read a p near
+            0.05 here as near 0.05, never as a verdict that fell one side of a
+            line.
           </p>
 
           {res.ladder.length>1 && (()=>{
@@ -1052,14 +1616,31 @@ FERC queue data, December.`}
                   <text className="axis" x={P.l-6} y={y(mg*f)+3} textAnchor="end">{fmt(mg*f)}</text>
                   <text className="axis" x={x(mg*f)} y={H-P.b+15} textAnchor="middle">{fmt(mg*f)}</text>
                 </g>))}
-              {N.map(n=>(
-                <g key={n.ticker}>
-                  <circle cx={x(n.gross)} cy={y(n.press)} r={3+n.n}
-                          fill={n.n>=2?"var(--crowd)":"var(--indep)"}
-                          opacity={n.n>=2?.75:.5}/>
-                  {n.n>=2 && <text className="axis" x={x(n.gross)+6+n.n}
-                                   y={y(n.press)+3}>{n.ticker}</text>}
-                </g>))}
+              {(()=>{
+                // Equal-weighted books put several names at exactly the same
+                // point, and four labels printed at one coordinate render as
+                // an unreadable smear. Names within a few pixels are collapsed
+                // into one label listing them.
+                const seen=[];
+                N.filter(n=>n.n>=2).forEach(n=>{
+                  const cx=x(n.gross), cy=y(n.press);
+                  const near=seen.find(g=>Math.abs(g.cx-cx)<7&&Math.abs(g.cy-cy)<7);
+                  if(near) near.names.push(n.ticker);
+                  else seen.push({cx,cy,names:[n.ticker],r:3+n.n});
+                });
+                return (<React.Fragment>
+                  {N.map(n=>(
+                    <circle key={n.ticker} cx={x(n.gross)} cy={y(n.press)} r={3+n.n}
+                            fill={n.n>=2?"var(--crowd)":"var(--indep)"}
+                            opacity={n.n>=2?.75:.5}/>))}
+                  {seen.map((g,i)=>(
+                    <text key={i} className="axis" x={g.cx+6+g.r} y={g.cy+3}>
+                      {g.names.length>3
+                        ? g.names.slice(0,3).join(" ")+" +"+(g.names.length-3)
+                        : g.names.join(" ")}
+                    </text>))}
+                </React.Fragment>);
+              })()}
               <text className="axis" x={W/2} y={H-6} textAnchor="middle">
                 gross exposure — dot size is how many managers are long it
               </text>
@@ -1072,9 +1653,9 @@ FERC queue data, December.`}
               return (<tr key={n.ticker}>
                 <td className="v">{n.ticker}</td>
                 <td className="v">{n.n}</td>
-                <td className="v">{n.press.toFixed(3)}</td>
-                <td className="v">{n.net.toFixed(3)}</td>
-                <td className="v">{n.gross.toFixed(3)}</td>
+                <td className="v">{res.inCash?(n.press/1e6).toFixed(1)+"m":n.press.toFixed(3)}</td>
+                <td className="v">{res.inCash?(n.net/1e6).toFixed(1)+"m":n.net.toFixed(3)}</td>
+                <td className="v">{res.inCash?(n.gross/1e6).toFixed(1)+"m":n.gross.toFixed(3)}</td>
                 <td className="v" style={{color:Math.abs(r)<0.5?"var(--crowd)":"inherit"}}>
                   {Math.round(r*100)}%</td>
               </tr>);})}
@@ -1157,6 +1738,36 @@ FERC queue data, December.`}
             </tbody>
           </table>
 
+          <p className="note">
+            Each document was reduced to a structured claim — driver, direction,
+            mechanism, dated catalysts, falsifier — and then every claim was shown
+            to the model at once and grouped by whether one event would prove them
+            right or wrong together. The pass compares; it does not name. An
+            earlier design asked each document in isolation to invent a label that
+            would coincidentally match another document's label, and five managers
+            on one bet produced five different labels.
+          </p>
+          <p className="note">
+            The model is told to use only what the documents state and not to
+            import what it knows about any real company, so a group has to come
+            from what a manager wrote about a ticker rather than from the model
+            recognising the ticker. That is what makes a group traceable to a
+            sentence. It is a prompt, not a guarantee, and it is the first thing
+            to attack if a group looks wrong. Confidence is the model's confidence
+            in the claim it extracted, not in whether the bet is any good.
+          </p>
+          {tRes.multi&&tRes.multi.length>0&&(
+            <p className="note">
+              <strong>{tRes.multi.join(", ")}</strong>{" "}
+              {tRes.multi.length>1?"appear":"appears"} in more than one group.
+              Nothing forbids that and a manager genuinely can be running two
+              bets, so membership is treated as a set: two managers share a bet
+              when their groups intersect. Worth reading those rows twice — a
+              manager in several groups is either running several bets or was
+              described vaguely enough to fit several.
+            </p>
+          )}
+
           {(()=>{
             // Two axes as a picture: every pair placed by how much its books
             // overlap and whether the managers are making one bet. The top-left
@@ -1180,18 +1791,32 @@ FERC queue data, December.`}
                   <text className="axis" x={x(mx*f)} y={H-P.b+15} textAnchor="middle">
                     {(mx*f*100).toFixed(0)}%</text>
                 </g>))}
-              {C.map((c,i)=>{
-                const jitter=((i*37)%9-4)*3.2;
-                const latent=c.shared&&c.jac<0.05;
-                return (
-                <g key={i}>
-                  <circle cx={x(c.jac)} cy={rowY(c.shared)+jitter} r={latent?6.5:4}
-                          fill={c.cell==="crowded"?"var(--crowd)":latent?"var(--hl)":"var(--indep)"}
-                          stroke={latent?"var(--ink)":"none"} strokeWidth="1.2"
-                          opacity={c.shared?.95:.45}/>
-                  {c.shared && <text className="axis" x={x(c.jac)+9} y={rowY(true)+jitter+3}>
-                    {c.a} · {c.b}</text>}
-                </g>);})}
+              {(()=>{
+                // The latent pairs all sit at 0% overlap by definition, so a
+                // pseudo-random jitter stacked them on the same pixel and the
+                // labels overprinted. Pairs are bucketed by x and each bucket
+                // fans out in a fixed vertical order instead.
+                const bucket={};
+                C.forEach((c,i)=>{ const key=Math.round(x(c.jac)/12);
+                  (bucket[key]=bucket[key]||[]).push({c,i}); });
+                const placed=[];
+                Object.values(bucket).forEach(list=>{
+                  list.forEach((e,k)=>{
+                    const spread=(k-(list.length-1)/2)*13;
+                    placed.push({...e, dy:spread}); });
+                });
+                return placed.map(({c,i,dy})=>{
+                  const latent=c.shared&&c.jac<0.05;
+                  return (
+                  <g key={i}>
+                    <circle cx={x(c.jac)} cy={rowY(c.shared)+dy} r={latent?6.5:4}
+                            fill={c.cell==="crowded"?"var(--crowd)":latent?"var(--hl)":"var(--indep)"}
+                            stroke={latent?"var(--ink)":"none"} strokeWidth="1.2"
+                            opacity={c.shared?.95:.45}/>
+                    {c.shared && <text className="axis" x={x(c.jac)+9} y={rowY(c.shared)+dy+3}>
+                      {c.a} · {c.b}</text>}
+                  </g>);});
+              })()}
               <text className="axis" x={W/2} y={H-6} textAnchor="middle">
                 share of long book held in common
               </text>
@@ -1221,6 +1846,20 @@ FERC queue data, December.`}
             </tbody>
           </table>
 
+          <p className="note">
+            The reading column is about exits, not about who is wrong.{" "}
+            <strong>Same bet, same names</strong> means that when the thesis
+            breaks both managers reach for the same door in the same hour, and the
+            second one out is marked at what the first did to the price — the loss
+            is the crowding, not the analysis.{" "}
+            <strong>Same bet, different names</strong> means the correlation is
+            already there and no position report will show it; the books stay
+            clean while the P&amp;L converges. Two managers land here on the
+            model's reading of their prose, which is a judgement and not a
+            measurement — the returns table above is where that reading can be
+            checked against what the books actually did.
+          </p>
+
           {tRes.months.length>0 && (
             <React.Fragment>
               <h2 style={{fontSize:"15px",marginTop:20}}>Catalysts by month</h2>
@@ -1245,6 +1884,28 @@ FERC queue data, December.`}
                 Several managers waiting on one month is concentration in time.
                 No exposure report shows it, because it is not an exposure — the
                 books can be perfectly diversified and still resolve together.
+              </p>
+              <p className="note">
+                <strong>A manager who wrote no dates is not in this chart.</strong>{" "}
+                Every bar is built from catalysts the documents actually stated,
+                and the extraction returns null rather than guessing a date from
+                vague language. An empty month is therefore a fact about the
+                writing before it is a fact about the risk, and the tallest bar
+                partly measures who writes specifically. Read it as a prompt to
+                ask the quiet ones what their date is, not as a complete calendar.
+              </p>
+              <p className="note">
+                <strong>Relative timing resolves against an as-of date, and it
+                has to.</strong> A memo saying "December" carries its year on
+                the letterhead rather than in the sentence, so anything reading
+                it later must be told which December. Without that anchor two
+                runs over identical theses produced different calendars — one
+                placed catalysts in a January falling before the books existed —
+                while the pairs and the grouping stayed stable across those same
+                runs. Only the calendar moved, which is why it went unnoticed.
+                Dates now resolve forward from the last date in the returns
+                data, and genuinely vague timing returns null rather than a
+                guess.
               </p>
             </React.Fragment>
           )}
