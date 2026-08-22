@@ -7,7 +7,7 @@ constructed to crowd into a shared basket. Five hold no name in common with
 each other but load on the same factor. Ranked by return correlation, the
 second group looks like the problem and the first is invisible.
 
-The five that get missed cost **14.8×** more than an average pod when one of
+The five that get missed cost **7×** more than an independent pod when one of
 them is forced to liquidate.
 
 ---
@@ -16,13 +16,16 @@ them is forced to liquidate.
 
 ```
                  return corr   after factors removed   book overlap
-crowded pods        +0.140            +0.138              18.1%
-factor pods         +0.765            +0.053               0.0%
-independent         +0.003            +0.001               2.6%
+crowded pods        +0.138            +0.147              18.1%
+factor pods         +0.764            +0.053               0.0%
+independent         -0.003            +0.001               2.6%
 ```
 
-The pods holding **nothing in common** correlate at 0.765. The pods sharing
-nearly a fifth of their books correlate at 0.140 — a fifth as much.
+The pods holding **nothing in common** correlate at 0.764. The pods sharing
+nearly a fifth of their books correlate at 0.138 — a fifth as much. Strip the
+shared factor exposure and the ordering reverses completely: the factor pairs
+fall to 0.053 while the crowded pairs do not move at all, because what they
+share was never a factor.
 
 A risk desk ranking pairs by correlation calls in the factor pods, whose
 exposure should be hedged centrally without anyone changing a position, and
@@ -33,13 +36,19 @@ Forced liquidation, averaged over every pod of each type:
 
 ```
   pod liquidated      mean cost to the other 19
-  crowded                   -6.98m
-  independent               -0.47m
-  factor                    -0.29m
+  crowded                   -9.44m
+  factor                    -3.56m
+  independent               -1.27m
 ```
 
 The detector picks its victim from **holdings alone, never from the labels**.
 It picked a planted crowded pod.
+
+The multiple is roughly 7× here and was 15× on a different random seed, because
+the stress test runs in whichever era is most crowded and the mid-1990s eras
+are similar but not identical. Treat the multiple as a magnitude, not a
+measurement: what is stable across seeds is that crowded pods are the expensive
+ones to lose, not the precise factor.
 
 ---
 
@@ -107,7 +116,12 @@ factor pods, because they rescale on the same grid. Fitting inside each block
 tracks it, and is what a risk desk does anyway: a loading averaged over thirty
 years describes no position anyone currently holds.
 
-After the third fix: factor pairs 0.764 → 0.053, crowded pairs unmoved.
+After the third fix: factor pairs 0.764 → 0.101 with the market and the beta
+spread removed, and → 0.053 with three further components. Crowded pairs sit at
+0.138 raw and 0.147 after all five, unmoved. Note where the drop happens:
+removing the market alone takes factor pairs only to 0.573, and it is the beta
+spread that does the work — direct evidence that a dollar-neutral book is
+insulated from the market and the exposure was in the spread all along.
 
 ---
 
@@ -156,17 +170,18 @@ finding, and the sweep is printed so the invariance is visible rather than
 claimed.
 
 **Crowding has a chance floor.** Two books of B names drawn from U eligible
-share about B²/U by luck. 45% of the fund's gross book sits in names two or
+share about B²/U by luck. 45.0% of the fund's gross book sits in names two or
 more pods hold, and 36.6% of that is what twenty managers drawing from one
-universe produce by counting alone. Real and chance separate only in the tail.
-A report quoting the headline share without its floor is reporting arithmetic
-as risk.
+universe produce by counting alone. The excess peaks at t=3 (+9.4pp) and decays
+from there. A report quoting the headline share without its floor is reporting
+arithmetic as risk.
 
 **Net against gross is argued, not demonstrated.** The distinction is real:
 net exposure measures market risk, one-way pressure measures liquidation risk,
 and they can point opposite ways on the same name. But in a universe this wide
 pods rarely take opposite sides, so this simulation shows the divergence weakly
-— 3 of 12 names in the worst era. Stated here rather than overclaimed.
+— between 1 and 3 of the twelve most crowded names, depending on the era and
+the seed. Stated here rather than overclaimed.
 
 **Crowding is partly a function of universe breadth.** The worst eras cluster
 in the mid-1990s, when fewer names were eligible and the same twenty books piled
