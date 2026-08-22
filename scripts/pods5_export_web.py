@@ -1,0 +1,271 @@
+"""
+pods5_export_web.py
+-------------------
+Runs the whole chain once and writes the numbers to JSON, so the dashboard is
+a renderer and not a calculator.
+
+WHY EVERYTHING IS PRECOMPUTED
+
+  Every figure the page displays comes out of this script. The browser draws
+  and nothing else - it does not resample, it does not fit a regression, it
+  does not decide what is significant. Two reasons, and the second matters
+  more than the first.
+
+  The practical one: the permutation nulls are thousands of resamples over a
+  thirty-year panel. That is a server job, not a main-thread job.
+
+  The real one: a chart that computes its own statistics can quietly disagree
+  with the scripts that produced them, and then there are two answers with no
+  way to tell which is the project's. Here there is exactly one path from data
+  to number, it runs in Python, and the page can only show what that path
+  produced.
+
+Run:
+  python scripts\\pods5_export_web.py
+  python scripts\\pods5_export_web.py --n-boot 500 --n-perm 300
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pods2_crowding import (  # noqa: E402
+    benjamini_hochberg, overlap_stats, pair_pvalues, residualise, stock_factors,
+)
+from pods3_exposure import era_weights, eligible_by_era, fund_stats  # noqa: E402
+from pods4_unwind import era_books, name_stats, pick_victim, unwind  # noqa: E402
+
+
+def jsonable(x):
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return None if not np.isfinite(x) else round(float(x), 6)
+    if isinstance(x, np.ndarray):
+        return [jsonable(v) for v in x]
+    return x
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--indir", default="data/processed")
+    ap.add_argument("--outdir", default="docs/data")
+    ap.add_argument("--factors", type=int, nargs="+", default=[1, 2, 3, 5])
+    ap.add_argument("--n-boot", type=int, default=300)
+    ap.add_argument("--n-perm", type=int, default=200)
+    ap.add_argument("--block", type=int, default=21)
+    ap.add_argument("--resid-window", type=int, default=63)
+    ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--min-pods", type=int, default=3)
+    ap.add_argument("--turnover", type=float, default=0.005)
+    ap.add_argument("--nav", type=float, default=100e6)
+    ap.add_argument("--coefficients", type=float, nargs="+",
+                    default=[0.1, 0.3, 1.0, 3.0])
+    ap.add_argument("--seed", type=int, default=20260822)
+    a = ap.parse_args()
+
+    os.makedirs(a.outdir, exist_ok=True)
+    rng = np.random.default_rng(a.seed)
+
+    R = pd.read_csv(os.path.join(a.indir, "pods_returns.csv"),
+                    index_col=0, parse_dates=True)
+    holds = pd.read_csv(os.path.join(a.indir, "pods_holdings.csv"))
+    truth = pd.read_csv(os.path.join(a.indir, "pods_truth.csv"))
+    ty = dict(zip(truth["pod"], truth["type"]))
+    pods = list(R.columns)
+    eras = sorted(holds["era"].unique())
+    m = len(pods)
+    n_pairs = m * (m - 1) // 2
+
+    out = {
+        "meta": {
+            "n_pods": m, "n_pairs": n_pairs, "n_eras": len(eras),
+            "n_days": len(R),
+            "start": str(R.index[0].date()), "end": str(R.index[-1].date()),
+            "nav_per_pod": a.nav, "alpha": a.alpha,
+            "n_boot": a.n_boot, "n_perm": a.n_perm,
+            "min_pods": a.min_pods, "turnover": a.turnover,
+            "resid_window": a.resid_window,
+        }
+    }
+
+    # ------------------------------------------------------- pod summary
+    ann = R.mean() * 252
+    vol = R.std() * np.sqrt(252)
+    out["pods"] = [{
+        "id": p, "type": ty.get(p, ""),
+        "ann_ret": jsonable(ann[p]), "ann_vol": jsonable(vol[p]),
+        "sharpe": jsonable(ann[p] / vol[p] if vol[p] else np.nan),
+    } for p in pods]
+
+    # ------------------------------------------------------------- pairs
+    print("[1/4] factors and residual correlations ...", flush=True)
+    F, share_cum, n_stk = stock_factors(a.indir, R.index, max(a.factors))
+    out["meta"]["factor_names"] = list(F.columns)
+    out["meta"]["n_stocks_factor"] = int(n_stk)
+
+    ov, iu_o, p_ov = overlap_stats(holds, pods, rng, a.n_perm)
+    keep_ov = benjamini_hochberg(p_ov, a.alpha)
+    raw_corr = R.corr().to_numpy()
+
+    out["pairs"] = {}
+    out["separation"] = []
+    for k in a.factors:
+        E = residualise(R, F, k, a.resid_window)
+        C, iu, p_res = pair_pvalues(E, a.n_boot, a.block, rng)
+        keep_res = benjamini_hochberg(p_res, a.alpha)
+        both = keep_res & keep_ov
+
+        rows = []
+        for t in range(len(iu[0])):
+            i, j = iu[0][t], iu[1][t]
+            s = {ty.get(pods[i]), ty.get(pods[j])}
+            rows.append({
+                "a": pods[i], "b": pods[j],
+                "raw": jsonable(raw_corr[i, j]),
+                "resid": jsonable(C[i, j]),
+                "overlap": jsonable(ov[i, j]),
+                "flagged": bool(both[t]),
+                "true": (list(s)[0] if len(s) == 1 else "mixed"),
+            })
+        out["pairs"][str(k)] = rows
+
+        by = {}
+        for t_ in ["crowded", "factor", "independent", "mixed"]:
+            sel = [r for r in rows if r["true"] == t_]
+            if sel:
+                by[t_] = {
+                    "n": len(sel),
+                    "raw": jsonable(np.mean([r["raw"] for r in sel])),
+                    "resid": jsonable(np.mean([r["resid"] for r in sel])),
+                    "flagged": int(sum(r["flagged"] for r in sel)),
+                }
+        out["separation"].append({"k": k,
+                                  "factors": list(F.columns[:k]), "by_type": by})
+        print(f"      k={k} done", flush=True)
+
+    # -------------------------------------------------- concentration
+    print("[2/4] fund-level concentration ...", flush=True)
+    per_era, ts_rows = {}, []
+    for e in eras:
+        W, names = era_weights(holds, pods, e)
+        st = fund_stats(W, a.min_pods)
+        if st is None:
+            continue
+        per_era[e] = (W, names, st)
+        ts_rows.append({"era": str(e), "hhi": jsonable(st["hhi"]),
+                        "crowded_share": jsonable(st["crowded_share"]),
+                        "top10": jsonable(st["top10_share"]),
+                        "n_crowded": int(st["n_crowded_names"])})
+    out["era_series"] = ts_rows
+
+    pool = eligible_by_era(a.indir, eras)
+    null_lad = []
+    for _ in range(a.n_perm):
+        lad = []
+        for e in eras:
+            if e not in per_era:
+                continue
+            W, names, _ = per_era[e]
+            univ = pool.get(e)
+            if univ is None or len(univ) < 4 * W.shape[0]:
+                continue
+            nl = int((W > 0).sum(axis=1).mean())
+            ns = int((W < 0).sum(axis=1).mean())
+            Wp = np.zeros((W.shape[0], len(univ)))
+            for p_i in range(W.shape[0]):
+                pick = rng.choice(len(univ), size=nl + ns, replace=False)
+                Wp[p_i, pick[:nl]] = 0.5 / max(nl, 1)
+                Wp[p_i, pick[nl:]] = -0.5 / max(ns, 1)
+            st = fund_stats(Wp, a.min_pods)
+            if st:
+                lad.append(st["ladder"])
+        if lad:
+            null_lad.append({t: np.mean([d[t] for d in lad]) for t in range(2, 11)})
+
+    out["ladder"] = []
+    for t in range(2, 11):
+        real = float(np.mean([per_era[e][2]["ladder"][t] for e in per_era]))
+        nl = np.array([d[t] for d in null_lad])
+        p = float((np.sum(nl >= real) + 1) / (len(nl) + 1))
+        out["ladder"].append({"t": t, "real": jsonable(real),
+                              "chance": jsonable(nl.mean()), "p": jsonable(p)})
+
+    # --------------------------------------------------------- worst era
+    worst = max(per_era, key=lambda e: per_era[e][2]["crowded_share"])
+    W, names, st = per_era[worst]
+    order = np.argsort(-st["long_press"])[:14]
+    out["worst_era"] = {
+        "era": str(worst),
+        "names": [{"permno": int(names[i]), "n_long": int(st["n_long"][i]),
+                   "long_press": jsonable(st["long_press"][i]),
+                   "net": jsonable(st["net"][i]),
+                   "gross": jsonable(st["gross"][i])} for i in order]
+    }
+
+    # ------------------------------------------------------------ unwind
+    print("[3/4] unwind stress ...", flush=True)
+    i_e = eras.index(worst)
+    e0 = pd.Timestamp(worst)
+    e1 = pd.Timestamp(eras[i_e + 1]) if i_e + 1 < len(eras) else e0 + pd.Timedelta(days=90)
+    panel = pd.read_csv(os.path.join(a.indir, "panel_daily.csv"),
+                        parse_dates=["date"],
+                        usecols=["permno", "date", "ret_adj", "mktcap"])
+    nvol, ncap = name_stats(panel, e0, e1)
+    books = era_books(holds, pods, worst)
+    victim, score = pick_victim(books, pods)
+
+    sweep = []
+    for coef in a.coefficients:
+        pnl, _ = unwind(books, victim, pods, nvol, ncap, coef, a.turnover, a.nav)
+        others = {p: v for p, v in pnl.items() if p != victim}
+        cr = [v for p, v in others.items() if ty.get(p) == "crowded"]
+        ind = [v for p, v in others.items() if ty.get(p) == "independent"]
+        sweep.append({
+            "coef": coef, "victim_pnl": jsonable(pnl[victim]),
+            "others_total": jsonable(sum(others.values())),
+            "worst_other": jsonable(min(others.values())),
+            "n_hurt": int(sum(1 for v in others.values() if v < 0)),
+            "gap": jsonable(np.mean(cr) - np.mean(ind) if cr and ind else np.nan),
+        })
+
+    mid = a.coefficients[len(a.coefficients) // 2]
+    control = {}
+    for v in pods:
+        pnl_v, _ = unwind(books, v, pods, nvol, ncap, mid, a.turnover, a.nav)
+        others_v = {p: x for p, x in pnl_v.items() if p != v}
+        control.setdefault(ty.get(v, "?"), []).append({
+            "total": sum(others_v.values()),
+            "worst": min(others_v.values()),
+            "n_hurt": sum(1 for x in others_v.values() if x < 0)})
+    out["unwind"] = {
+        "era": str(worst), "victim": victim, "overlap_score": jsonable(score),
+        "victim_true_type": ty.get(victim, ""),
+        "coefficient_sweep": sweep, "control_coef": mid,
+        "control": [{"type": t, "n": len(v),
+                     "mean_damage": jsonable(np.mean([x["total"] for x in v])),
+                     "worst": jsonable(np.mean([x["worst"] for x in v])),
+                     "n_hurt": jsonable(np.mean([x["n_hurt"] for x in v]))}
+                    for t, v in control.items()],
+    }
+
+    # -------------------------------------------------------------- write
+    print("[4/4] writing ...", flush=True)
+    path = os.path.join(a.outdir, "orchestrator.json")
+    with open(path, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+    mb = os.path.getsize(path) / 1e6
+    print(f"\nwrote {path}  ({mb:.2f} MB)")
+    print(f"  {m} pods, {n_pairs} pairs x {len(a.factors)} factor settings")
+    print(f"  {len(ts_rows)} eras, ladder t=2..10, unwind over "
+          f"{len(a.coefficients)} coefficients")
+    print("\npreview locally:  python -m http.server 8000 --directory docs")
+
+
+if __name__ == "__main__":
+    main()

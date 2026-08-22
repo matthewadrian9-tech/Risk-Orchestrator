@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Risk Orchestrator — the correlation matrix points at the wrong pods</title>
+<style>
+:root{
+  --bg:#eef0f2; --card:#fff; --ink:#16181c; --mute:#6b7280; --line:#d9dde2;
+  --crowd:#c0304a; --factor:#2f6f8f; --indep:#8b8f96; --pos:#1f7a4d; --neg:#c0304a;
+  --hl:#f4c95d;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+.wrap{max-width:1080px;margin:0 auto;padding:34px 22px 90px}
+.kicker{font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+  letter-spacing:.16em;text-transform:uppercase;color:var(--mute);margin-bottom:10px}
+h1{font-size:31px;line-height:1.18;margin:0 0 12px;letter-spacing:-.02em;font-weight:700}
+.lede{color:#3d434b;max-width:60ch;margin:0 0 6px}
+h2{font-size:17px;margin:0 0 4px;letter-spacing:-.01em}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:11px;
+  padding:20px 22px;margin-top:20px}
+.note{color:var(--mute);font-size:13.2px;margin:10px 0 0;max-width:74ch}
+.note strong{color:var(--ink)}
+hr{border:0;border-top:1px solid var(--line);margin:26px 0}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13.5px}
+th{font:11px/1.4 ui-monospace,Menlo,monospace;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--mute);text-align:right;
+  padding:0 8px 7px;border-bottom:1px solid var(--line);font-weight:500}
+th:first-child{text-align:left}
+td{padding:7px 8px;border-bottom:1px solid #eef0f3;text-align:right;
+  font-variant-numeric:tabular-nums}
+td:first-child{text-align:left}
+tr:last-child td{border-bottom:0}
+.v{font-family:ui-monospace,Menlo,monospace;font-size:12.8px}
+.pos{color:var(--pos)} .neg{color:var(--neg)}
+.tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;
+  font-family:ui-monospace,Menlo,monospace;color:#fff}
+.t-crowded{background:var(--crowd)} .t-factor{background:var(--factor)}
+.t-independent{background:var(--indep)} .t-mixed{background:#b9bec5}
+.btn{font:12.5px ui-monospace,Menlo,monospace;background:var(--card);
+  border:1px solid var(--line);border-radius:7px;padding:5px 11px;cursor:pointer;color:var(--ink)}
+.btn[aria-pressed="true"]{background:var(--ink);color:#fff;border-color:var(--ink)}
+.bar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.gl{stroke:#e6e9ed;stroke-width:1}
+.axis{font:10.5px ui-monospace,Menlo,monospace;fill:var(--mute)}
+.big{font-size:27px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;margin-top:6px}
+.stat{border-left:3px solid var(--line);padding-left:13px}
+.stat .lbl{font:11px ui-monospace,Menlo,monospace;color:var(--mute);
+  text-transform:uppercase;letter-spacing:.08em}
+.foot{color:var(--mute);font-size:12.4px;margin-top:26px;line-height:1.65}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useEffect,useMemo}=React;
+
+const pctf=v=>(v==null?"—":(v*100).toFixed(1)+"%");
+const cor=v=>(v==null?"—":(v>=0?"+":"")+v.toFixed(3));
+const usd=v=>{ if(v==null) return "—";
+  const m=v/1e6; return (m>=0?"+":"")+m.toFixed(2)+"m"; };
+
+/* ---------- 1. the setup: pods that all look fine ---------- */
+function PodTable({pods}){
+  const [sort,setSort]=useState("id");
+  const rows=useMemo(()=>{
+    const c=[...pods];
+    if(sort==="sharpe") c.sort((a,b)=>b.sharpe-a.sharpe);
+    if(sort==="vol") c.sort((a,b)=>b.ann_vol-a.ann_vol);
+    return c;
+  },[pods,sort]);
+  return (
+    <div className="panel">
+      <h2>Twenty pods, each defensible on its own</h2>
+      <p className="note" style={{marginTop:2}}>
+        Every book is dollar-neutral, scaled to the same target volatility, and
+        rebalanced quarterly. An allocator reviewing these one at a time has
+        nothing to object to — the Sharpe ratios are unremarkable and the
+        volatilities are nearly identical. The labels are the ground truth of
+        the simulation and would not exist at a real fund; they are shown
+        because the whole question is whether the tools recover them.
+      </p>
+      <div className="bar">
+        <span className="axis">sort</span>
+        <button className="btn" aria-pressed={sort==="id"} onClick={()=>setSort("id")}>pod</button>
+        <button className="btn" aria-pressed={sort==="sharpe"} onClick={()=>setSort("sharpe")}>sharpe</button>
+        <button className="btn" aria-pressed={sort==="vol"} onClick={()=>setSort("vol")}>volatility</button>
+      </div>
+      <table>
+        <thead><tr><th>Pod</th><th>Type</th><th>Ann return</th>
+          <th>Ann vol</th><th>Sharpe</th></tr></thead>
+        <tbody>{rows.map(p=>(
+          <tr key={p.id}>
+            <td className="v">{p.id}</td>
+            <td><span className={"tag t-"+p.type}>{p.type}</span></td>
+            <td className={"v "+(p.ann_ret>=0?"pos":"neg")}>{pctf(p.ann_ret)}</td>
+            <td className="v">{pctf(p.ann_vol)}</td>
+            <td className="v">{p.sharpe==null?"—":p.sharpe.toFixed(2)}</td>
+          </tr>))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ---------- 2. raw vs residual, the core claim ---------- */
+function Separation({data}){
+  const ks=data.separation.map(s=>s.k);
+  const [k,setK]=useState(ks[1]!==undefined?ks[1]:ks[0]);
+  const sep=data.separation.find(s=>s.k===k);
+  const pairs=data.pairs[String(k)];
+  const W=700,H=310,P={t:16,r:16,b:44,l:52};
+  const lim=0.9;
+  const x=v=>P.l+((v+lim)/(2*lim))*(W-P.l-P.r);
+  const y=v=>P.t+(1-(v+lim)/(2*lim))*(H-P.t-P.b);
+  const col=t=>t==="crowded"?"var(--crowd)":t==="factor"?"var(--factor)":
+    t==="independent"?"var(--indep)":"#c8ccd2";
+  return (
+    <div className="panel">
+      <h2>What the correlation matrix sees, and what is actually shared</h2>
+      <p className="note" style={{marginTop:2}}>
+        Horizontal is plain return correlation — the number a standard risk
+        report ranks on. Vertical is correlation after common factor exposure
+        has been regressed out, re-fitted every {data.meta.resid_window} days
+        because a pod's loading changes each time it rebalances.
+      </p>
+      <div className="bar">
+        <span className="axis">factors removed</span>
+        {data.separation.map(s=>(
+          <button key={s.k} className="btn" aria-pressed={s.k===k}
+                  onClick={()=>setK(s.k)}>{s.factors.join(" + ")}</button>
+        ))}
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:10}}
+           role="img" aria-label="raw against residual correlation by pair">
+        {[-0.5,0,0.5].map(t=>(
+          <g key={t}>
+            <line className="gl" x1={x(t)} x2={x(t)} y1={P.t} y2={H-P.b}/>
+            <line className="gl" x1={P.l} x2={W-P.r} y1={y(t)} y2={y(t)}/>
+            <text className="axis" x={x(t)} y={H-P.b+15} textAnchor="middle">{t}</text>
+            <text className="axis" x={P.l-7} y={y(t)+3} textAnchor="end">{t}</text>
+          </g>
+        ))}
+        <line x1={P.l} x2={W-P.r} y1={y(0)} y2={y(0)} stroke="#c3c8cf" strokeWidth="1"/>
+        <line x1={x(0)} x2={x(0)} y1={P.t} y2={H-P.b} stroke="#c3c8cf" strokeWidth="1"/>
+        <line x1={x(-lim)} y1={y(-lim)} x2={x(lim)} y2={y(lim)}
+              stroke="#c3c8cf" strokeDasharray="4 4" strokeWidth="1"/>
+        {pairs.filter(p=>!p.flagged).map((p,i)=>(
+          <circle key={"u"+i} cx={x(p.raw)} cy={y(p.resid)} r="3"
+                  fill={col(p.true)} opacity={p.true==="mixed"?.28:.8}/>
+        ))}
+        {pairs.filter(p=>p.flagged).map((p,i)=>(
+          <g key={"f"+i}>
+            <circle cx={x(p.raw)} cy={y(p.resid)} r="7.5" fill="none"
+                    stroke="var(--hl)" strokeWidth="2.4"/>
+            <circle cx={x(p.raw)} cy={y(p.resid)} r="3.4" fill={col(p.true)}/>
+          </g>
+        ))}
+        <text className="axis" x={(W)/2} y={H-8} textAnchor="middle">
+          return correlation
+        </text>
+        <text className="axis" x={14} y={H/2} textAnchor="middle"
+              transform={`rotate(-90 14 ${H/2})`}>residual correlation</text>
+      </svg>
+      <table>
+        <thead><tr><th>Pairs</th><th>Count</th><th>Return corr</th>
+          <th>Residual corr</th><th>Flagged</th></tr></thead>
+        <tbody>{["crowded","factor","independent","mixed"].map(t=>{
+          const b=sep.by_type[t]; if(!b) return null;
+          return (<tr key={t}>
+            <td><span className={"tag t-"+t}>{t}</span></td>
+            <td className="v">{b.n}</td>
+            <td className="v">{cor(b.raw)}</td>
+            <td className="v">{cor(b.resid)}</td>
+            <td className="v">{b.flagged}</td>
+          </tr>);})}
+        </tbody>
+      </table>
+      <p className="note">
+        The factor row is the point. Those pods hold <strong>not one name in
+        common</strong> and correlate at {cor(sep.by_type.factor?.raw)}; after the
+        shared exposure comes out they sit at {cor(sep.by_type.factor?.resid)}.
+        The crowded pods barely move — {cor(sep.by_type.crowded?.raw)} to{" "}
+        {cor(sep.by_type.crowded?.resid)} — because what they share is not a
+        factor. Rank pairs by the horizontal axis and every pod you call in is
+        the wrong one.
+      </p>
+      <p className="note">
+        A pair is flagged — ringed in amber — only when its residual correlation and its
+        holdings overlap both survive Benjamini-Hochberg across all{" "}
+        {data.meta.n_pairs} pairs. Either alone is weak: correlated residuals
+        can be a factor the model missed, and shared names can be two managers
+        liking one sector. Both together is the signature.
+      </p>
+    </div>
+  );
+}
+
+/* ---------- 3. concentration against chance ---------- */
+function Ladder({data}){
+  const all=data.ladder;
+  // Plot only as far as there is something to see. Everything past the last
+  // threshold holding 0.1% of the book draws as a flat line on zero, which
+  // makes the chart claim the story ends earlier than the table says it does.
+  const lastLive=Math.max(...all.filter(d=>d.real>=0.001).map(d=>d.t));
+  const L=all.filter(d=>d.t<=lastLive);
+  const W=700,H=270,P={t:16,r:16,b:42,l:52};
+  const max=Math.max(...L.map(d=>Math.max(d.real,d.chance)))*1.08;
+  const span=Math.max(1,lastLive-2);
+  const x=t=>P.l+((t-2)/span)*(W-P.l-P.r);
+  const y=v=>P.t+(1-v/max)*(H-P.t-P.b);
+  const path=key=>L.map((d,i)=>(i?"L":"M")+x(d.t).toFixed(1)+" "+y(d[key]).toFixed(1)).join(" ");
+  const first=L.find(d=>d.p<data.meta.alpha&&d.real>=0.001);
+  return (
+    <div className="panel">
+      <h2>How much of the book is genuinely crowded, and how much is arithmetic</h2>
+      <p className="note" style={{marginTop:2}}>
+        Share of the fund's gross book sitting in names held long by t or more
+        separate pods, against what independent selection from the same
+        universe produces.
+      </p>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:10}}
+           role="img" aria-label="crowding against chance by threshold">
+        {[0,.25,.5,.75].filter(v=>v<max).map(v=>(
+          <g key={v}>
+            <line className="gl" x1={P.l} x2={W-P.r} y1={y(v)} y2={y(v)}/>
+            <text className="axis" x={P.l-7} y={y(v)+3} textAnchor="end">{Math.round(v*100)}%</text>
+          </g>
+        ))}
+        <path d={path("chance")} fill="none" stroke="#9aa1a9" strokeWidth="1.8" strokeDasharray="5 4"/>
+        <path d={path("real")} fill="none" stroke="var(--crowd)" strokeWidth="2.4"/>
+        {L.map(d=>(
+          <g key={d.t}>
+            <circle cx={x(d.t)} cy={y(d.real)} r="3.4" fill="var(--crowd)"/>
+            <circle cx={x(d.t)} cy={y(d.chance)} r="2.6" fill="#9aa1a9"/>
+            <text className="axis" x={x(d.t)} y={H-P.b+15} textAnchor="middle">{d.t}</text>
+          </g>
+        ))}
+        <text className="axis" x={W/2} y={H-8} textAnchor="middle">
+          held long by t or more pods{lastLive<10?"  (higher thresholds hold under 0.1% of the book)":""}
+        </text>
+      </svg>
+      <table>
+        <thead><tr><th>t</th><th>Real</th><th>Chance</th><th>Excess</th><th>p</th></tr></thead>
+        <tbody>{L.map(d=>{
+          // A p-value here is censored, not measured, whenever no permutation
+          // reached the real value - and that is exactly what happens once the
+          // chance line hits zero. The p then equals 1/(draws+1) no matter how
+          // large the excess is, so 0.005 on a +1.2pp gap and 0.005 on a
+          // +0.3pp gap are the same number for the same uninformative reason.
+          // The first version of this check tested whether BOTH sides were
+          // near zero, which missed these rows entirely: real was 1.3% while
+          // chance was 0.0%. The floor lives on the null side alone.
+          const floored=d.p<=1.5/(data.meta.n_perm+1);
+          const dead=d.real<0.001&&d.chance<0.001;
+          return (
+          <tr key={d.t} style={dead?{opacity:.45}:null}>
+            <td className="v">{d.t}</td>
+            <td className="v">{pctf(d.real)}</td>
+            <td className="v">{pctf(d.chance)}</td>
+            <td className={"v "+(!dead&&d.real-d.chance>0?"pos":"")}>
+              {dead?"—":(d.real-d.chance>=0?"+":"")+((d.real-d.chance)*100).toFixed(1)+"pp"}</td>
+            <td className="v" title={floored?"censored at the null's resolution":""}>
+              {dead?"—":(floored?"<"+(1.5/(data.meta.n_perm+1)).toFixed(3):d.p.toFixed(3))}</td>
+          </tr>);})}
+        </tbody>
+      </table>
+      <p className="note">
+        Rows are greyed where both real and chance fall below 0.1% of the book:
+        nothing left to compare at that size. Where p reads as a
+        <strong> less-than</strong>, no permutation out of {data.meta.n_perm}
+        {" "}ever reached the real value, so the figure is the resolution of the
+        null rather than a measurement — the true p could be far smaller and the
+        printed number would be identical. Reporting {(1/(data.meta.n_perm+1)).toFixed(3)}
+        {" "}on several rows at once would be reporting the number of draws as if
+        it were several separate findings.
+      </p>
+      <p className="note">
+        The dashed line is why this chart exists. {pctf(L[0].real)} of the book
+        sits in names two or more pods hold — an alarming sentence, and{" "}
+        {pctf(all[0].chance)} of it is what {data.meta.n_pods} managers drawing
+        from one universe produce by counting alone.
+        {first && <> Real and chance separate at t = {first.t}. </>}
+        A report quoting the headline share without its chance floor is
+        reporting arithmetic as risk.
+      </p>
+    </div>
+  );
+}
+
+/* ---------- 4. the unwind ---------- */
+function Unwind({data}){
+  const u=data.unwind;
+  const ctrl=["crowded","factor","independent"]
+    .map(t=>u.control.find(c=>c.type===t)).filter(Boolean);
+  const cr=ctrl.find(c=>c.type==="crowded"), ind=ctrl.find(c=>c.type==="independent");
+  const mult=cr&&ind&&ind.mean_damage!==0
+    ? Math.abs(cr.mean_damage/ind.mean_damage) : null;
+  const worst=Math.min(...ctrl.map(c=>c.mean_damage));
+  return (
+    <div className="panel">
+      <h2>What it costs when one of them is forced out</h2>
+      <p className="note" style={{marginTop:2}}>
+        In the most crowded era ({u.era}), each pod in turn is liquidated and
+        the others are marked at the moved price. Impact is square-root in size
+        over a liquidity proxy, since CRSP carries no volume — so the dollar
+        figures are a scenario, not an estimate. What survives the assumption
+        is which group absorbs the loss.
+      </p>
+      <div className="grid3" style={{marginTop:16}}>
+        {ctrl.map(c=>(
+          <div className="stat" key={c.type}
+               style={{borderLeftColor:c.type==="crowded"?"var(--crowd)":
+                       c.type==="factor"?"var(--factor)":"var(--indep)"}}>
+            <div className="lbl">{c.type} pod liquidated</div>
+            <div className={"big "+(c.mean_damage<0?"neg":"pos")}>{usd(c.mean_damage)}</div>
+            <div className="axis">mean cost to the other {data.meta.n_pods-1} pods</div>
+          </div>
+        ))}
+      </div>
+      <svg viewBox="0 0 700 132" style={{width:"100%",height:"auto",marginTop:14}}
+           role="img" aria-label="damage by type of pod liquidated">
+        {ctrl.map((c,i)=>{
+          // Linear bars put -0.29m and -0.47m at visually identical lengths
+          // next to -6.98m, so the smaller of the two read as the larger. A
+          // square-root scale keeps the dominant bar dominant while leaving
+          // the small ones distinguishable. The axis note says so, because a
+          // bar chart whose scale is not stated is a chart that can mislead.
+          const w=Math.sqrt(Math.abs(c.mean_damage)/Math.abs(worst))*470;
+          const gain=c.mean_damage>0;
+          return (
+          <g key={c.type} transform={`translate(0 ${i*38})`}>
+            <text className="axis" x="0" y="20">{c.type}</text>
+            <rect x="96" y="8" width={Math.max(3,w)} height="16"
+                  fill={gain?"var(--pos)":(c.type==="crowded"?"var(--crowd)":"#b9bec5")}
+                  opacity={c.type==="crowded"?.95:.75} rx="2"/>
+            <text className="axis" x={104+Math.max(3,w)} y="20">
+              {usd(c.mean_damage)}{gain?"  (a gain)":""}
+            </text>
+          </g>);})}
+        <text className="axis" x="0" y="126">
+          bar length is square-root scaled, so the two small bars stay
+          distinguishable beside the large one
+        </text>
+      </svg>
+      {mult && (
+        <p className="note">
+          Liquidating a crowded pod costs the rest of the fund{" "}
+          <strong>{mult.toFixed(1)}×</strong> what liquidating an independent one
+          costs. Averaged over every pod of each type, so no single unlucky draw
+          decides it. Liquidating a factor pod is{" "}
+          {ctrl.find(c=>c.type==="factor")?.mean_damage>0?"profitable":"cheap"}{" "}
+          for everyone else — the pods short those names collect what the seller
+          gives up.
+        </p>
+      )}
+      <table>
+        <thead><tr><th>Impact coefficient</th><th>Seller</th>
+          <th>Everyone else</th><th>Worst single pod</th><th>Pods hurt</th></tr></thead>
+        <tbody>{u.coefficient_sweep.map(s=>(
+          <tr key={s.coef}>
+            <td className="v">{s.coef.toFixed(1)}</td>
+            <td className="v neg">{usd(s.victim_pnl)}</td>
+            <td className={"v "+(s.others_total<0?"neg":"pos")}>{usd(s.others_total)}</td>
+            <td className="v neg">{usd(s.worst_other)}</td>
+            <td className="v">{s.n_hurt}</td>
+          </tr>))}
+        </tbody>
+      </table>
+      <p className="note">
+        The dollar column moves by a factor of {(u.coefficient_sweep[u.coefficient_sweep.length-1].coef/u.coefficient_sweep[0].coef).toFixed(0)}{" "}
+        down this table, because it is proportional to an assumption no daily
+        return file can pin down. That is stated rather than hidden: the number
+        to carry away is the multiple above, which the coefficient divides out
+        of.
+      </p>
+      <p className="note">
+        The pod liquidated in the sweep, <strong>{u.victim}</strong>, was chosen
+        by long-book overlap alone — holdings only, no labels. It turned out to
+        be {u.victim_true_type==="crowded"
+          ? "one of the planted crowded pods."
+          : "of type "+u.victim_true_type+"."}
+      </p>
+    </div>
+  );
+}
+
+/* ---------- 5. net against gross ---------- */
+function NetGross({data}){
+  const w=data.worst_era;
+  const hidden=w.names.filter(n=>n.gross>0&&Math.abs(n.net)/n.gross<0.5
+    &&n.n_long>=data.meta.min_pods).length;
+  return (
+    <div className="panel">
+      <h2>Net exposure against one-way pressure</h2>
+      <p className="note" style={{marginTop:2}}>
+        The most crowded names in {w.era}. Net is what the fund loses if the
+        price moves — the right measure of market risk. Long pressure is the
+        weight that would be sold into one bid if every holder left, which is
+        the right measure of liquidation risk. They are different numbers and
+        they answer different questions.
+      </p>
+      <table>
+        <thead><tr><th>Permno</th><th>Pods long</th><th>Long pressure</th>
+          <th>Net</th><th>Gross</th><th>Net / gross</th></tr></thead>
+        <tbody>{w.names.map(n=>{
+          const r=n.gross>0?n.net/n.gross:0;
+          return (<tr key={n.permno}>
+            <td className="v">{n.permno}</td>
+            <td className="v">{n.n_long}</td>
+            <td className="v">{n.long_press.toFixed(3)}</td>
+            <td className="v">{n.net.toFixed(3)}</td>
+            <td className="v">{n.gross.toFixed(3)}</td>
+            <td className="v" style={{color:r<0.5?"var(--crowd)":"inherit"}}>
+              {Math.round(r*100)}%</td>
+          </tr>);})}
+        </tbody>
+      </table>
+      <p className="note">
+        {hidden>0
+          ? <>{hidden} of these {w.names.length} names carry a net position under
+             half their gross. A net-exposure report shows them as modest
+             holdings while several managers are each long them and would each
+             sell into the same bid.</>
+          : <>Net and gross mostly agree here, so a net-exposure report would not
+             have missed these names. Worth stating plainly rather than claiming
+             otherwise — the two measures only diverge when pods take opposite
+             sides, and in a universe this wide they rarely do. The argument for
+             reporting both stands on principle; this simulation does not
+             demonstrate it strongly.</>}
+      </p>
+    </div>
+  );
+}
+
+function App(){
+  const [d,setD]=useState(null);
+  const [err,setErr]=useState(null);
+  useEffect(()=>{
+    fetch("data/orchestrator.json")
+      .then(r=>{ if(!r.ok) throw new Error("data/orchestrator.json not found — run pods5_export_web.py"); return r.json(); })
+      .then(setD).catch(e=>setErr(e.message));
+  },[]);
+  if(err) return <div className="wrap"><p className="note">{err}</p></div>;
+  if(!d) return <div className="wrap"><p className="note">loading…</p></div>;
+  const m=d.meta;
+  return (
+    <div className="wrap">
+      <div className="kicker">multi-manager risk · crsp 1993–2024 · simulated pods, real returns</div>
+      <h1>The correlation matrix points at the wrong five pods</h1>
+      <p className="lede">
+        Twenty long/short books built from real CRSP returns. Five were
+        constructed to crowd into a shared basket; five hold no name in common
+        with each other but load on the same factor. Ranked by return
+        correlation, the second group looks like the problem and the first is
+        invisible.
+      </p>
+      <hr/>
+      <PodTable pods={d.pods}/>
+      <Separation data={d}/>
+      <Ladder data={d}/>
+      <Unwind data={d}/>
+      <NetGross data={d}/>
+      <p className="foot">
+        {m.n_pods} pods over {m.n_days.toLocaleString()} trading days ({m.start} to {m.end}),
+        {" "}{m.n_eras} quarterly rebalances, {m.n_pairs} pairs.
+        Factors built from {m.n_stocks_factor} stocks: {m.factor_names.join(", ")}.
+        Residual nulls use a circular block bootstrap at {m.n_boot} draws;
+        holdings nulls use {m.n_perm} permutations. Both are pooled across pairs,
+        because a per-pair p-value floored at 1/(draws+1) cannot clear
+        Benjamini-Hochberg's threshold of α/{m.n_pairs}.
+        Every number here was computed by the pipeline before the page loaded;
+        the browser only draws.
+      </p>
+      <p className="foot">
+        The returns are real and the allocations are invented. Nothing here is a
+        backtest and no pod is a strategy — the pods exist to generate a
+        realistic joint structure across books, which is what a risk tool has to
+        work on. Reading a Sharpe ratio out of this page would be reading it
+        wrong.
+      </p>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
