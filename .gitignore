@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 !docs/data/
+
+*.docx
+*.key
+.env
+secrets.*
