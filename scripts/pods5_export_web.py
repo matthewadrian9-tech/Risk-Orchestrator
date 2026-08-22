@@ -208,6 +208,22 @@ def main():
     worst = ranked[0]
     W, names, st = per_era[worst]
     order = np.argsort(-st["long_press"])[:14]
+    # who holds each crowded name, so the overlap is visible as a grid rather
+    # than only as a summary statistic
+    crowded_idx = [i for i in range(len(names)) if st["n_long"][i] >= a.min_pods]
+    crowded_idx.sort(key=lambda i: -st["long_press"][i])
+    crowded_idx = crowded_idx[:20]
+    out["holdings_grid"] = {
+        "era": str(worst),
+        "names": [int(names[i]) for i in crowded_idx],
+        "n_long": [int(st["n_long"][i]) for i in crowded_idx],
+        "pods": pods,
+        "types": [ty.get(p, "") for p in pods],
+        # -1 short, 0 flat, 1 long
+        "cells": [[int(np.sign(W[p_i, i])) for i in crowded_idx]
+                  for p_i in range(len(pods))],
+    }
+
     out["worst_era"] = {
         "era": str(worst),
         "names": [{"permno": int(names[i]), "n_long": int(st["n_long"][i]),
@@ -281,6 +297,97 @@ def main():
                      "n_hurt": jsonable(np.mean([x["n_hurt"] for x in v]))}
                     for t, v in control.items()],
     }
+
+    # -------------------------------------------------- the thesis layer
+    # Optional: present only when pods6/pods7 have been run. The position
+    # analysis above stands on its own without it.
+    tp = "outputs/thesis_pairs.csv"
+    tx = "outputs/thesis_extract.json"
+    tc = "outputs/thesis_clusters.json"
+    if os.path.exists(tp) and os.path.exists(tx):
+        tpairs = pd.read_csv(tp)
+        ext = json.load(open(tx))
+        first_ex = {k: (v[0] if v else None) for k, v in ext.items()}
+
+        groups = []
+        if os.path.exists(tc):
+            cl = json.load(open(tc))
+            runs_c = cl.get("runs", [])
+            if runs_c and runs_c[0]:
+                order = sorted(runs_c[0].get("groups", []),
+                               key=lambda g: -len(g.get("members", [])))
+                names_c = sorted(ext.keys())
+                for g in order:
+                    mem = [names_c[i] for i in g.get("members", [])
+                           if i < len(names_c)]
+                    if not mem:
+                        continue
+                    groups.append({
+                        "plain": g.get("plain", ""),
+                        "members": mem,
+                        "types": [ty.get(m, "") for m in mem],
+                        "opposed": [names_c[i] for i in (g.get("opposed") or [])
+                                    if i < len(names_c)],
+                        "confidence": g.get("confidence", ""),
+                    })
+
+        cal_p = "outputs/thesis_calendar.csv"
+        weeks = []
+        if os.path.exists(cal_p):
+            cal = pd.read_csv(cal_p, parse_dates=["date"])
+            cal["week"] = cal["date"].dt.to_period("W").astype(str)
+            wk = (cal.groupby("week")
+                     .agg(pods=("pod", "nunique"), decisive=("decisive", "sum"),
+                          n=("what", "size"))
+                     .reset_index().sort_values("week"))
+            weeks = [{"week": r["week"], "pods": int(r["pods"]),
+                      "decisive": int(r["decisive"]), "n": int(r["n"])}
+                     for _, r in wk.iterrows()]
+
+        # the two axes, with the residual correlation each pair carries
+        kk = res_pairs = None
+        cr_path = "outputs/crowding_pairs.csv"
+        merged = []
+        if os.path.exists(cr_path):
+            cr = pd.read_csv(cr_path)
+            kk = int(cr["k"].max())
+            cr = cr[cr["k"] == kk][["pod_a", "pod_b", "raw_corr", "resid_corr"]]
+            mm = tpairs.merge(cr, left_on=["a", "b"],
+                              right_on=["pod_a", "pod_b"], how="left")
+        else:
+            mm = tpairs.assign(raw_corr=np.nan, resid_corr=np.nan)
+        jac_hi = max(float(tpairs["book_overlap"].quantile(0.9)), 0.05)
+        for _, r in mm.iterrows():
+            t = float(r["thesis_overlap"]) >= 0.5
+            b = float(r["book_overlap"]) >= jac_hi
+            merged.append({
+                "a": r["a"], "b": r["b"],
+                "thesis": jsonable(r["thesis_overlap"]),
+                "book": jsonable(r["book_overlap"]),
+                "raw": jsonable(r.get("raw_corr")),
+                "resid": jsonable(r.get("resid_corr")),
+                "true": r["type_a"] if r["type_a"] == r["type_b"] else "mixed",
+                "cell": ("crowded" if (t and b) else "latent" if t
+                         else "coincidental" if b else "independent"),
+            })
+
+        man_p = os.path.join(a.indir, "theses_manifest.csv")
+        gen_by = ""
+        if os.path.exists(man_p):
+            gen_by = str(pd.read_csv(man_p)["generated_by"].iloc[0])
+
+        out["thesis"] = {
+            "groups": groups,
+            "weeks": weeks,
+            "pairs": merged,
+            "k_factors": kk,
+            "generated_by": gen_by,
+            "n_runs": max((len(v) for v in ext.values()), default=1),
+            "drivers": {p: (first_ex[p] or {}).get("driver_plain", "")
+                        for p in first_ex},
+        }
+        print(f"      thesis layer: {len(groups)} groups, {len(weeks)} weeks, "
+              f"{len(merged)} pairs", flush=True)
 
     # -------------------------------------------------------------- write
     print("[4/4] writing ...", flush=True)

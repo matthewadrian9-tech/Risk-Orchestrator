@@ -293,6 +293,1125 @@ function Ladder({data}){
   );
 }
 
+
+/* ---------- who holds what ---------- */
+function Grid({data}){
+  const g=data.holdings_grid;
+  if(!g) return null;
+  const [only,setOnly]=useState(false);
+  const rows=g.pods.map((p,i)=>({pod:p,type:g.types[i],cells:g.cells[i]}))
+    .filter(r=>!only||r.cells.some(c=>c>0));
+  const cw=Math.min(34,760/g.names.length);
+  const W=150+g.names.length*cw, H=34+rows.length*17;
+  return (
+    <div className="panel">
+      <h2>Who is actually in the crowded names</h2>
+      <p className="note" style={{marginTop:2}}>
+        The {g.names.length} names with the most one-way pressure in {g.era},
+        against every pod. Filled square is long, hollow is short, blank is not
+        held. This is the raw fact the statistics summarise — no test, no null,
+        just the books side by side.
+      </p>
+      <div className="bar">
+        <button className="btn" aria-pressed={only} onClick={()=>setOnly(!only)}>
+          {only?"✓ ":""}only pods holding these
+        </button>
+      </div>
+      <div style={{overflowX:"auto",marginTop:10}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",minWidth:Math.min(W,700)+"px",height:"auto"}}
+           role="img" aria-label="pods against crowded names">
+        {g.names.map((n,j)=>(
+          <text key={n} className="axis" x={150+j*cw+cw/2} y={26}
+                textAnchor="start" transform={`rotate(-60 ${150+j*cw+cw/2} 26)`}>
+            {n}
+          </text>
+        ))}
+        {rows.map((r,i)=>(
+          <g key={r.pod} transform={`translate(0 ${34+i*17})`}>
+            <text className="axis" x="0" y="11">{r.pod}</text>
+            <rect x="62" y="2" width="52" height="11" rx="5"
+                  fill={r.type==="crowded"?"var(--crowd)":
+                        r.type==="factor"?"var(--factor)":"var(--indep)"}/>
+            <text x="88" y="11" textAnchor="middle"
+                  style={{fill:"#fff",font:"9px ui-monospace,Menlo,monospace"}}>
+              {r.type.slice(0,6)}
+            </text>
+            {r.cells.map((c,j)=>(
+              c===0?null:
+              <rect key={j} x={150+j*cw+2} y="2" width={cw-4} height="11" rx="2"
+                    fill={c>0?(r.type==="crowded"?"var(--crowd)":"#7d848c"):"none"}
+                    stroke={c>0?"none":"#9aa1a9"} strokeWidth="1"
+                    opacity={c>0?.9:.8}/>
+            ))}
+          </g>
+        ))}
+      </svg>
+      </div>
+      <p className="note">
+        The dark band is the five crowded pods sharing a basket — the same
+        columns filled again and again. A correlation matrix compresses that
+        picture into one number per pair and, as the chart above shows, that
+        number puts these pods near the bottom of the ranking. The overlap was
+        never hidden; it was only invisible in the statistic people look at.
+      </p>
+    </div>
+  );
+}
+
+
+
+
+/* The two prompts below are the same ones scripts/pods7_thesis_risk.py sends.
+   If they drift apart, the page and the pipeline would answer the same
+   question differently, which is the failure this project already hit once
+   when two scripts each defined "most crowded era" their own way. */
+const EXTRACT_SYS=`You are a risk analyst at a multi-manager hedge fund. You are given one portfolio manager's internal investment thesis. Reduce it to a structured claim so that theses from different managers can be compared with each other.
+
+You are comparing BETS, not prose. Two managers can write about the same sector while betting in opposite directions, and two managers can describe one bet in completely different vocabulary. Extract what is being bet on and which way, not what the document is about.
+
+Hard constraints:
+- Use only what the document states. Do not infer a driver the manager did not describe.
+- Describe the driver in plain words. Do NOT invent a canonical label or slug; grouping happens in a later pass that sees every thesis at once.
+- Dates: convert relative timing to an approximate ISO date where the document gives enough to do so, otherwise null.
+
+Respond with JSON only, no prose outside it, no markdown fences:
+{"driver_plain":"<one sentence: the underlying cause being bet on>","direction":"long_the_driver"|"short_the_driver","mechanism":"<one sentence>","horizon_quarters":<number>,"catalysts":[{"what":"<short>","approx_date":"<YYYY-MM-DD or null>","decisive":true|false}],"falsifier":"<what would prove it wrong>"}`;
+
+const CLUSTER_SYS=`You are a risk analyst at a multi-manager hedge fund. You are given a numbered list of the bets each portfolio manager is making, one line per manager.
+
+Group the managers who are betting on THE SAME UNDERLYING CAUSE. Two managers belong together when the same event or condition in the world would make both of them right, or both of them wrong - regardless of how differently they describe it, which sector they express it in, or which names they hold.
+
+- Different vocabulary, same cause -> SAME group.
+- Same sector, different cause -> DIFFERENT groups.
+- Opposite sides of one cause -> SAME group, noted as opposed.
+- A manager whose cause is genuinely their own -> a group of one. Over-grouping produces false crowding alerts, which is the failure mode that gets a tool ignored.
+
+Respond with JSON only, no prose outside it, no markdown fences:
+{"groups":[{"group_id":"<slug>","plain":"<one sentence naming the shared cause>","members":[<numbers>],"opposed":[<numbers>],"confidence":"high"|"medium"|"low"}]}`;
+
+async function askClaude(key, system, user, maxTokens){
+  const r=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"content-type":"application/json","x-api-key":key,
+             "anthropic-version":"2023-06-01",
+             "anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:maxTokens||1500,
+                         system, messages:[{role:"user",content:user}]})
+  });
+  if(!r.ok) throw new Error("API "+r.status+": "+(await r.text()).slice(0,180));
+  const d=await r.json();
+  const t=(d.content||[]).map(b=>b.text||"").join("");
+  const c=t.trim().replace(/^```json/,"").replace(/^```/,"").replace(/```$/,"").trim();
+  try{ return JSON.parse(c); }
+  catch(e){ const m=c.match(/\{[\s\S]*\}/); if(m) return JSON.parse(m[0]); throw new Error("model did not return JSON"); }
+}
+
+/* ---------- run it on your own book ---------- */
+function Upload(){
+  const [err,setErr]=useState(null);
+  const [minPods,setMinPods]=useState(2);
+  const [nPerm,setNPerm]=useState(200);
+  const [busy,setBusy]=useState(false);
+  const [res,setRes]=useState(null);
+
+  const parse=(text,fileName)=>{
+    const lines=text.split(/\r?\n/).filter(l=>l.trim());
+    if(lines.length<2) throw new Error(`${fileName}: no rows`);
+    const head=lines[0].split(",").map(h=>h.trim().toLowerCase());
+    if(!head.includes("ticker"))
+      throw new Error(`${fileName}: no "ticker" column. Found: ${head.join(", ")}`);
+    const iPod=head.indexOf("pod"), iTic=head.indexOf("ticker");
+    // One file per manager is the natural way to hand this over, so a file
+    // with no pod column IS one pod and takes its name from the file.
+    const fallbackPod=fileName.replace(/\.[^.]+$/,"");
+    const iW=head.indexOf("weight"), iS=head.indexOf("side"),
+          iN=head.indexOf("nominal"), iNav=head.indexOf("nav");
+    const out=[];
+    for(let i=1;i<lines.length;i++){
+      const c=lines[i].split(",").map(x=>x.trim());
+      if(c.length<2) continue;
+      let w=iW>=0?parseFloat(c[iW]):NaN;
+      let nom=iN>=0?parseFloat(c[iN]):NaN;
+      const nav=iNav>=0?parseFloat(c[iNav]):NaN;
+      // A weight is a fraction of the pod's OWN nav, so summing weights across
+      // pods silently treats a 500m book and a 50m book as the same size. Where
+      // nav or nominal is supplied, exposure is carried in currency instead and
+      // the aggregation is correct; where it is not, the equal-size assumption
+      // is made explicit in the output rather than buried here.
+      if(!isFinite(nom)&&isFinite(w)&&isFinite(nav)) nom=w*nav;
+      if(!isFinite(w)&&isFinite(nom)&&isFinite(nav)&&nav!==0) w=nom/nav;
+      let side=iS>=0?(c[iS]||"").toLowerCase():"";
+      if(!side) side=((isFinite(w)&&w<0)||(isFinite(nom)&&nom<0))?"short":"long";
+      out.push({pod:(iPod>=0&&c[iPod])?c[iPod]:fallbackPod, ticker:c[iTic],
+                weight:isFinite(w)?Math.abs(w):null,
+                nominal:isFinite(nom)?Math.abs(nom):null,
+                side:side.startsWith("s")?"short":"long"});
+    }
+    if(!out.length) throw new Error("no usable rows");
+    // equal-weight within each leg where weights were not supplied
+    const legs={};
+    out.forEach(r=>{ if(r.weight===null){
+      const k=r.pod+"|"+r.side; legs[k]=(legs[k]||0)+1; }});
+    out.forEach(r=>{ if(r.weight===null){
+      r.weight=0.5/legs[r.pod+"|"+r.side]; r.assumed=true; }});
+    return out;
+  };
+
+  // One row per manager, each holding that manager's book and, optionally,
+  // what they wrote. Keeping both in the same row is the answer to "which
+  // thesis belongs to which pod" - it is not inferred from a file name, it is
+  // stated, and the row shows it.
+  const [slots,setSlots]=useState([
+    {id:1,name:"",pos:null,posRows:[],thesis:null,thesisFile:""},
+    {id:2,name:"",pos:null,posRows:[],thesisFile:"",thesis:null},
+  ]);
+  const [nextId,setNextId]=useState(3);
+  const addSlot=()=>{ setSlots(sl=>[...sl,{id:nextId,name:"",pos:null,
+    posRows:[],thesis:null,thesisFile:""}]); setNextId(n=>n+1); };
+  const dropSlot=id=>setSlots(sl=>sl.filter(x=>x.id!==id));
+  const setSlot=(id,patch)=>setSlots(sl=>sl.map(x=>x.id===id?{...x,...patch}:x));
+
+  const loadPositions=(id,file)=>{
+    if(!file) return;
+    setErr(null); setRes(null);
+    file.text().then(t=>{
+      try{
+        const auto=file.name.replace(/\.[^.]+$/,"");
+        const cur=slots.find(x=>x.id===id);
+        const nm=(cur&&cur.name)?cur.name:auto;
+        const p=parse(t,file.name).map(r=>({...r,pod:nm}));
+        setSlot(id,{pos:file.name,posRows:p,name:nm});
+      }catch(ex){ setErr(ex.message); }
+    });
+  };
+  const loadThesis=(id,file)=>{
+    if(!file) return;
+    setErr(null);
+    file.text().then(t=>{
+      const auto=file.name.replace(/\.[^.]+$/,"");
+      const cur=slots.find(x=>x.id===id);
+      setSlot(id,{thesis:t,thesisFile:file.name,
+                  name:(cur&&cur.name)?cur.name:auto});
+    });
+  };
+
+  // renaming a manager relabels their positions too
+  const rename=(id,nm)=>setSlots(sl=>sl.map(x=>x.id===id
+    ? {...x,name:nm,posRows:x.posRows.map(r=>({...r,pod:nm}))} : x));
+
+  const rows=useMemo(()=>{
+    const all=[];
+    slots.forEach(s2=>{ if(s2.name) all.push(...s2.posRows); });
+    return all.length?all:null;
+  },[slots]);
+  const theses=useMemo(()=>{
+    const t={};
+    slots.forEach(s2=>{ if(s2.name&&s2.thesis) t[s2.name]=s2.thesis; });
+    return t;
+  },[slots]);
+
+  const run=()=>{
+    if(!rows) return;
+    setBusy(true);
+    setTimeout(()=>{
+      try{
+        const pods=[...new Set(rows.map(r=>r.pod))];
+        const uni=[...new Set(rows.map(r=>r.ticker))];
+        // Use currency if EVERY row has it. Mixing dollars and own-nav weights
+        // in one sum would be worse than either alone.
+        const inCash=rows.every(r=>r.nominal!=null);
+        rows.forEach(r=>{ r.exp = inCash ? r.nominal : r.weight; });
+        const longsBy={}, wByPod={};
+        pods.forEach(p=>{longsBy[p]=new Set(); wByPod[p]={};});
+        const net={}, gross={}, press={}, nLong={};
+        rows.forEach(r=>{
+          const sgn=r.side==="short"?-1:1;
+          net[r.ticker]=(net[r.ticker]||0)+sgn*r.exp;
+          gross[r.ticker]=(gross[r.ticker]||0)+r.exp;
+          if(sgn>0){
+            press[r.ticker]=(press[r.ticker]||0)+r.exp;
+            nLong[r.ticker]=(nLong[r.ticker]||0)+1;
+            longsBy[r.pod].add(r.ticker);
+          }
+        });
+        const G=Object.values(gross).reduce((a,b)=>a+b,0)||1;
+
+        // ladder, real
+        const ladder=[];
+        for(let t=2;t<=Math.min(8,pods.length);t++){
+          const share=Object.keys(gross)
+            .filter(k=>(nLong[k]||0)>=t)
+            .reduce((a,k)=>a+gross[k],0)/G;
+          ladder.push({t, real:share, chance:0, p:1});
+        }
+        // chance floor: redraw each pod's long book at random from the
+        // universe actually held, keeping book sizes fixed
+        const sizes=pods.map(p=>longsBy[p].size);
+        const nullShare={};
+        ladder.forEach(l=>nullShare[l.t]=[]);
+        for(let b=0;b<nPerm;b++){
+          const cnt={};
+          sizes.forEach(sz=>{
+            const pick=new Set();
+            while(pick.size<sz && pick.size<uni.length)
+              pick.add(uni[Math.floor(Math.random()*uni.length)]);
+            pick.forEach(k=>cnt[k]=(cnt[k]||0)+1);
+          });
+          ladder.forEach(l=>{
+            const s=Object.keys(cnt).filter(k=>cnt[k]>=l.t)
+              .reduce((a,k)=>a+(gross[k]||0),0)/G;
+            nullShare[l.t].push(s);
+          });
+        }
+        ladder.forEach(l=>{
+          const arr=nullShare[l.t];
+          l.chance=arr.reduce((a,b)=>a+b,0)/arr.length;
+          l.p=(arr.filter(x=>x>=l.real).length+1)/(arr.length+1);
+        });
+
+        // pairwise long-book overlap
+        const pairs=[];
+        for(let i=0;i<pods.length;i++)
+          for(let j=i+1;j<pods.length;j++){
+            const A=longsBy[pods[i]], B=longsBy[pods[j]];
+            let inter=0; A.forEach(x=>{if(B.has(x)) inter++;});
+            const uni2=A.size+B.size-inter;
+            pairs.push({a:pods[i], b:pods[j],
+                        jac:uni2?inter/uni2:0, shared:inter});
+          }
+        pairs.sort((x,y)=>y.jac-x.jac);
+
+        const names=Object.keys(gross).map(k=>({
+          ticker:k, net:net[k], gross:gross[k],
+          press:press[k]||0, n:nLong[k]||0}))
+          .sort((x,y)=>y.press-x.press).slice(0,15);
+
+        // per-manager summary
+        const mgr=pods.map(p=>{
+          const mine=rows.filter(r=>r.pod===p);
+          const L=mine.filter(r=>r.side==="long").reduce((a,r)=>a+r.exp,0);
+          const S=mine.filter(r=>r.side==="short").reduce((a,r)=>a+r.exp,0);
+          return {pod:p, nLong:mine.filter(r=>r.side==="long").length,
+                  nShort:mine.filter(r=>r.side==="short").length,
+                  gross:L+S, net:L-S,
+                  nav:(mine.find(r=>r.nominal!=null&&r.weight)||{}) &&
+                      (inCash? (mine[0].nominal/ (mine[0].weight||1)) : null)};
+        });
+
+        // grid: manager against the most-pressured names
+        const gridNames=names.slice(0,16).map(n=>n.ticker);
+        const grid=pods.map(p=>({pod:p, cells:gridNames.map(t=>{
+          const r=rows.find(x=>x.pod===p&&x.ticker===t);
+          return r?(r.side==="long"?1:-1):0;
+        })}));
+
+        // if one manager is forced out, who else is in those names
+        const exit=pods.map(p=>{
+          const theirs=rows.filter(r=>r.pod===p&&r.side==="long");
+          const set=new Set(theirs.map(r=>r.ticker));
+          const hit=pods.filter(q=>q!==p).map(q=>{
+            const ex=rows.filter(r=>r.pod===q&&r.side==="long"&&set.has(r.ticker));
+            return {pod:q, exposed:ex.reduce((a,r)=>a+r.exp,0),
+                    names:ex.length};
+          }).filter(h=>h.exposed>0).sort((a,b)=>b.exposed-a.exposed);
+          return {pod:p, sold:theirs.reduce((a,r)=>a+r.exp,0),
+                  others:hit.reduce((a,h)=>a+h.exposed,0),
+                  nHit:hit.length, top:hit.slice(0,3)};
+        }).sort((a,b)=>b.others-a.others);
+
+        const B=sizes.reduce((a,b)=>a+b,0)/Math.max(pods.length,1);
+        setRes({pods:pods.length, uni:uni.length, ladder, pairs, names,
+                mgr, grid, gridNames, exit,
+                floor:B*B/Math.max(uni.length,1)/(2*B),
+                inCash,
+                assumed:rows.some(r=>r.assumed)});
+      }catch(ex){ setErr(ex.message); }
+      setBusy(false);
+    },30);
+  };
+
+  // ---- thesis pass, run with the user's own key, in their browser
+  const [apiKey,setApiKey]=useState("");
+  const [tBusy,setTBusy]=useState("");
+  const [tRes,setTRes]=useState(null);
+  const runTheses=async()=>{
+    const pods=Object.keys(theses);
+    if(!pods.length||!apiKey) return;
+    setErr(null); setTRes(null);
+    try{
+      const ext={};
+      for(let i=0;i<pods.length;i++){
+        setTBusy(`reading ${pods[i]} (${i+1}/${pods.length})`);
+        ext[pods[i]]=await askClaude(apiKey, EXTRACT_SYS, theses[pods[i]]);
+      }
+      setTBusy("grouping by shared driver");
+      const lines=pods.map((p,i)=>
+        `${i}. driver: ${ext[p].driver_plain} | mechanism: ${ext[p].mechanism}`
+        +` | direction: ${ext[p].direction} | horizon: ${ext[p].horizon_quarters} quarters`);
+      const cl=await askClaude(apiKey, CLUSTER_SYS,
+        "The managers:\n\n"+lines.join("\n")+"\n\nGroup them by shared underlying cause.", 2500);
+
+      const grp={};
+      (cl.groups||[]).forEach(g=>(g.members||[]).forEach(i=>{
+        if(i>=0&&i<pods.length) grp[pods[i]]=g.group_id; }));
+
+      // long books from whatever positions were loaded
+      const longsBy={};
+      (rows||[]).forEach(r=>{ if(r.side==="long"){
+        (longsBy[r.pod]=longsBy[r.pod]||new Set()).add(r.ticker); }});
+
+      const cells=[];
+      for(let i=0;i<pods.length;i++)
+        for(let j=i+1;j<pods.length;j++){
+          const p=pods[i], q=pods[j];
+          const same=grp[p]!==undefined&&grp[p]===grp[q]
+                     &&ext[p].direction===ext[q].direction;
+          const A=longsBy[p], B=longsBy[q];
+          let jac=null;
+          if(A&&B){ let n=0; A.forEach(x=>{if(B.has(x)) n++;});
+                    jac=n/(A.size+B.size-n); }
+          cells.push({a:p,b:q,shared:same,jac,
+            cell: jac===null ? (same?"latent?":"—")
+                 : (same&&jac>=0.05) ? "crowded"
+                 : same ? "latent" : (jac>=0.05?"coincidental":"independent")});
+        }
+
+      const cal=[];
+      pods.forEach(p=>(ext[p].catalysts||[]).forEach(c=>{
+        if(c.approx_date) cal.push({pod:p, ...c}); }));
+      cal.sort((x,y)=>x.approx_date<y.approx_date?-1:1);
+      const byWeek={};
+      cal.forEach(c=>{ const w=c.approx_date.slice(0,7);
+        (byWeek[w]=byWeek[w]||new Set()).add(c.pod); });
+
+      setTRes({ext, groups:cl.groups||[], cells, pods, cal,
+               months:Object.entries(byWeek).map(([m,v])=>({m,pods:v.size}))
+                 .sort((x,y)=>x.m<y.m?-1:1)});
+      setTBusy("");
+    }catch(ex){ setErr(String(ex.message||ex)); setTBusy(""); }
+  };
+
+  const sample=`pod,ticker,weight,side
+pod_a,AAPL,0.05,long
+pod_a,MSFT,0.04,long
+pod_a,XOM,0.03,short
+pod_b,AAPL,0.06,long
+pod_b,NVDA,0.05,long
+pod_b,KO,0.04,short`;
+
+  return (
+    <div className="panel">
+      <h2>Run this on your own book</h2>
+      <p className="note" style={{marginTop:2}}>
+        Everything above is one simulated fund. The same aggregation runs on any
+        book. Add a row per manager, give each one their positions and — if you
+        have it — what they wrote. <strong>Press “+ add manager” for as many
+        rows as you need.</strong> The thesis sits in the same row as the book,
+        so which document belongs to which manager is stated rather than
+        guessed at.
+      </p>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",
+                   gap:"14px",marginTop:"12px"}}>
+        <div>
+          <div className="lbl" style={{marginBottom:6}}>positions file</div>
+          <pre style={{margin:0,padding:"10px 12px",background:"#f6f7f9",
+                       border:"1px solid var(--line)",borderRadius:"7px",
+                       font:"11.5px ui-monospace,Menlo,monospace",overflowX:"auto"}}>
+{`jsmith.csv
+ticker,weight,side
+AAPL,0.05,long
+NVDA,0.04,long
+XOM,0.03,short`}
+          </pre>
+          <p className="note" style={{marginTop:6}}>
+            No <code>pod</code> column needed — the row already says whose book
+            it is. Leave the name blank and the file name fills it in.
+          </p>
+        </div>
+        <div>
+          <div className="lbl" style={{marginBottom:6}}>thesis file</div>
+          <pre style={{margin:0,padding:"10px 12px",background:"#f6f7f9",
+                       border:"1px solid var(--line)",borderRadius:"7px",
+                       font:"11.5px ui-monospace,Menlo,monospace",overflowX:"auto"}}>
+{`jsmith.md
+
+MANDATE
+Long/short equity, gross to 200%,
+net +20 to +60%, no single name
+above 8% of NAV.
+
+THESIS
+The hyperscaler capex cycle is in
+its second inning, not its seventh…
+
+CATALYSTS
+Q4 results, late October.
+FERC queue data, December.`}
+          </pre>
+          <p className="note" style={{marginTop:6}}>
+            Any prose will do — a mandate, a pitch, a monthly note. Headings
+            are not required; the extraction reads whatever is there.
+          </p>
+        </div>
+      </div>
+      <p className="note">
+        <code>ticker</code> is the only required column. Instead of{" "}
+        <code>weight</code> you may give <code>nominal</code> and{" "}
+        <code>nav</code> and the weight is derived; instead of{" "}
+        <code>side</code> a negative weight is read as a short. If weight is
+        missing entirely each leg is assumed equal-weighted and the output says
+        so, because a crowding number computed on assumed weights is not the
+        same number as one computed on real ones.
+      </p>
+      <p className="note">
+        <strong>Nothing is uploaded.</strong> This page is a static file with no
+        server behind it; the parsing and the permutation null both run in your
+        browser and the positions never leave the machine. That is not a
+        courtesy — a real position file is the most confidential document a fund
+        has, and a tool that posts one anywhere is a tool nobody can use.
+      </p>
+      <table style={{marginTop:14}}>
+        <thead><tr>
+          <th style={{width:"22%"}}>Manager</th>
+          <th style={{textAlign:"left"}}>Positions (.csv)</th>
+          <th style={{textAlign:"left"}}>What they wrote (.md / .txt)</th>
+          <th style={{width:"1%"}}></th>
+        </tr></thead>
+        <tbody>{slots.map(sl=>(
+          <tr key={sl.id}>
+            <td>
+              <input value={sl.name} placeholder="name or desk"
+                     onChange={e=>rename(sl.id,e.target.value)}
+                     style={{font:"12.5px ui-monospace,Menlo,monospace",
+                             padding:"4px 8px",width:"100%",
+                             border:"1px solid var(--line)",borderRadius:"6px"}}/>
+            </td>
+            <td style={{textAlign:"left"}}>
+              <input type="file" accept=".csv,.txt"
+                     onChange={e=>loadPositions(sl.id,e.target.files[0])}
+                     style={{font:"11.5px ui-monospace,Menlo,monospace",maxWidth:"210px"}}/>
+              {sl.posRows.length>0 && (
+                <span className="counter" style={{marginLeft:6}}>
+                  {sl.posRows.length} rows
+                  {sl.posRows.every(r=>r.nominal!=null)?" · currency":" · weight only"}
+                </span>)}
+            </td>
+            <td style={{textAlign:"left"}}>
+              <input type="file" accept=".md,.txt"
+                     onChange={e=>loadThesis(sl.id,e.target.files[0])}
+                     style={{font:"11.5px ui-monospace,Menlo,monospace",maxWidth:"210px"}}/>
+              {sl.thesis && (
+                <span className="counter" style={{marginLeft:6}}>
+                  {sl.thesis.split(/\s+/).length} words
+                </span>)}
+            </td>
+            <td>
+              <button className="btn" onClick={()=>dropSlot(sl.id)}
+                      title="remove this manager"
+                      style={{padding:"2px 8px"}}>&times;</button>
+            </td>
+          </tr>))}
+        </tbody>
+      </table>
+
+      <div className="bar">
+        <button className="btn" onClick={addSlot}
+                style={{fontWeight:700}}>+ add manager</button>
+        <button className="btn" onClick={run} disabled={!rows||busy}>
+          {busy?"working…":"Analyse positions"}
+        </button>
+        <button className="btn" onClick={()=>{
+          [["jsmith.csv","ticker,weight,nav,side\nAAPL,0.22,300000000,long\nNVDA,0.20,300000000,long\nVRT,0.18,300000000,long\nETN,0.20,300000000,long\nSMCI,0.20,300000000,long\nXOM,0.25,300000000,short\nKO,0.25,300000000,short\nPG,0.25,300000000,short\nCL,0.25,300000000,short"],
+           ["mchen.csv","ticker,weight,nav,side\nAAPL,0.25,120000000,long\nVRT,0.25,120000000,long\nETN,0.25,120000000,long\nPWR,0.25,120000000,long\nKO,0.34,120000000,short\nPG,0.33,120000000,short\nGIS,0.33,120000000,short"],
+           ["rpatel.csv","ticker,weight,nav,side\nJPM,0.28,80000000,long\nBAC,0.24,80000000,long\nWFC,0.24,80000000,long\nC,0.24,80000000,long\nTLT,0.50,80000000,short\nGLD,0.50,80000000,short"]]
+          .forEach(([n,t])=>{
+            const b=new Blob([t],{type:"text/csv"});
+            const u=URL.createObjectURL(b); const a2=document.createElement("a");
+            a2.href=u; a2.download=n; a2.click(); URL.revokeObjectURL(u);
+          });
+        }}>example files</button>
+        <span className="counter">
+          {err?<span style={{color:"var(--crowd)"}}>{err}</span>
+             :rows?`${rows.length} positions across ${new Set(rows.map(r=>r.pod)).size} managers`
+             :"add a manager and load their book"}
+        </span>
+      </div>
+
+      <h2 style={{fontSize:"15px",marginTop:20}}>Then read what they wrote</h2>
+      <p className="note" style={{marginTop:2}}>
+        A second, separate step — because the first one is free and stays on
+        this machine, and this one is neither. Two prompts, the same ones{" "}
+        <code>scripts/pods7_thesis_risk.py</code> sends: one reduces each
+        document to a structured claim, the second sees every claim at once and
+        groups the managers whose bets would be proved right or wrong by the
+        same event. That reaches pairs betting on one cause through names that
+        do not overlap at all — which no amount of position analysis can.
+      </p>
+      <p className="note" style={{color:"var(--crowd)"}}>
+        <strong>Positions stay in your browser. Thesis text does not.</strong>{" "}
+        This step sends each document to Anthropic's API with the key you paste
+        below. The key lives in this page's memory, is stored nowhere, and dies
+        with the tab — but the documents leave the machine. At a real fund that
+        is a decision for compliance rather than for a web page, and the honest
+        answer there is to run the script against a model inside your own
+        perimeter.
+      </p>
+      <div className="bar">
+        <input type="password" value={apiKey} placeholder="sk-ant-…"
+               onChange={e=>setApiKey(e.target.value)}
+               style={{font:"12px ui-monospace,Menlo,monospace",padding:"5px 9px",
+                       border:"1px solid var(--line)",borderRadius:"7px",width:"240px"}}/>
+        <button className="btn" onClick={runTheses}
+                disabled={!apiKey||!Object.keys(theses).length||!!tBusy}>
+          {tBusy?tBusy:`Read ${Object.keys(theses).length} thesis file(s)`}
+        </button>
+        <span className="counter">
+          {Object.keys(theses).length
+            ? Object.keys(theses).join(", ")
+            : "no thesis files loaded"}
+        </span>
+      </div>
+
+      {res && (
+        <React.Fragment>
+          {res.assumed && (
+            <p className="note" style={{color:"var(--crowd)"}}>
+              Some rows had no weight, so those legs were treated as equal
+              weighted. Every number below inherits that assumption.
+            </p>
+          )}
+          <p className="note" style={{color:res.inCash?"inherit":"var(--crowd)"}}>
+            {res.inCash
+              ? "Exposures are in currency, so pods of different sizes are weighted correctly against each other."
+              : "No nominal or nav column, so exposures are fractions of each pod's own NAV — which treats every pod as the same size. A 500m book and a 50m book both showing 5% in a name are 25m and 2.5m of real exposure, and the tables below cannot tell them apart. Add nominal, or weight and nav, to fix this."}
+          </p>
+          <h2 style={{fontSize:"15px",marginTop:18}}>Each manager on their own</h2>
+          <p className="note" style={{marginTop:2}}>
+            The view an allocator gets one book at a time. Nothing here looks
+            wrong, which is the point — crowding is a property of the set and
+            is invisible in any single row.
+          </p>
+          <table>
+            <thead><tr><th>Manager</th><th>Longs</th><th>Shorts</th>
+              <th>Gross</th><th>Net</th><th>Net / gross</th></tr></thead>
+            <tbody>{res.mgr.map(m=>{
+              const f=v=>res.inCash?(v/1e6).toFixed(1)+"m":v.toFixed(2);
+              const r=m.gross?m.net/m.gross:0;
+              return (<tr key={m.pod}>
+                <td className="v">{m.pod}</td>
+                <td className="v">{m.nLong}</td>
+                <td className="v">{m.nShort}</td>
+                <td className="v">{f(m.gross)}</td>
+                <td className={"v "+(m.net>=0?"pos":"neg")}>{f(m.net)}</td>
+                <td className="v">{Math.round(r*100)}%</td>
+              </tr>);})}
+            </tbody>
+          </table>
+
+          <h2 style={{fontSize:"15px",marginTop:20}}>Who is in which name</h2>
+          <p className="note" style={{marginTop:2}}>
+            The most-pressured names against every manager. Filled square is
+            long, hollow is short, blank is not held. No test and no null —
+            just the books side by side, which is the raw fact everything else
+            on this page summarises.
+          </p>
+          <div style={{overflowX:"auto"}}>
+          {(()=>{
+            const G=res.grid, N=res.gridNames;
+            const cw=Math.min(36,620/Math.max(N.length,1));
+            const W=130+N.length*cw, H=40+G.length*18;
+            return (
+            <svg viewBox={`0 0 ${W} ${H}`}
+                 style={{width:"100%",minWidth:Math.min(W,660)+"px",height:"auto",marginTop:8}}
+                 role="img" aria-label="managers against names">
+              {N.map((t,j)=>(
+                <text key={t} className="axis" x={130+j*cw+cw/2} y={30}
+                      textAnchor="start"
+                      transform={`rotate(-55 ${130+j*cw+cw/2} 30)`}>{t}</text>))}
+              {G.map((g,i)=>(
+                <g key={g.pod} transform={`translate(0 ${40+i*18})`}>
+                  <text className="axis" x="0" y="12">{g.pod}</text>
+                  {g.cells.map((c,j)=>(c===0?null:
+                    <rect key={j} x={130+j*cw+2} y="2" width={cw-4} height="12" rx="2"
+                          fill={c>0?"var(--crowd)":"none"}
+                          stroke={c>0?"none":"#9aa1a9"} strokeWidth="1"
+                          opacity={c>0?.85:.8}/>))}
+                </g>))}
+            </svg>);})()}
+          </div>
+
+          <h2 style={{fontSize:"15px",marginTop:20}}>If one manager is forced out</h2>
+          <p className="note" style={{marginTop:2}}>
+            A stop-loss is automatic and nobody votes on it. If a manager is
+            liquidated, every other manager long the same names is marked at
+            whatever that selling does to the price. This ranks who would be
+            selling into whom. It is exposure at risk, not a loss estimate —
+            turning it into a number needs each name's volatility and a
+            liquidity proxy, which a position file does not carry.
+          </p>
+          <table>
+            <thead><tr><th>If this manager is liquidated</th><th>They sell</th>
+              <th>Others exposed to the same names</th><th>Managers hit</th></tr></thead>
+            <tbody>{res.exit.map(e=>{
+              const f=v=>res.inCash?(v/1e6).toFixed(1)+"m":v.toFixed(2);
+              return (<tr key={e.pod}>
+                <td className="v">{e.pod}</td>
+                <td className="v">{f(e.sold)}</td>
+                <td className={"v "+(e.others>0?"neg":"")}>{f(e.others)}</td>
+                <td className="v">{e.nHit}
+                  {e.top.length?" · "+e.top.map(t=>t.pod).join(", "):""}</td>
+              </tr>);})}
+            </tbody>
+          </table>
+          {res.exit[0] && res.exit[0].others>0 && (
+            <p className="note">
+              <strong>{res.exit[0].pod}</strong> is the expensive one to lose:
+              their forced exit puts{" "}
+              {res.inCash?(res.exit[0].others/1e6).toFixed(1)+"m":res.exit[0].others.toFixed(2)}{" "}
+              of other managers' positions into the same selling, across{" "}
+              {res.exit[0].nHit} book{res.exit[0].nHit>1?"s":""}. Note this is
+              not the manager with the largest book — it is the one whose book
+              other people share.
+            </p>
+          )}
+
+          <hr/>
+          <p className="note">
+            {res.pods} pods over {res.uni} distinct names. Two unrelated books
+            of this size share roughly{" "}
+            <strong>{(res.floor*100).toFixed(1)}%</strong> of their long names
+            by chance alone — the floor any crowding number has to clear.
+          </p>
+
+          {res.ladder.length>1 && (()=>{
+            const L=res.ladder, W=700,H=210,P={t:14,r:14,b:38,l:48};
+            const mx=Math.max(...L.map(d=>Math.max(d.real,d.chance)))*1.1||1;
+            const x=t=>P.l+((t-L[0].t)/Math.max(1,L.length-1))*(W-P.l-P.r);
+            const y=v=>P.t+(1-v/mx)*(H-P.t-P.b);
+            const pth=k=>L.map((d,i)=>(i?"L":"M")+x(d.t).toFixed(1)+" "+y(d[k]).toFixed(1)).join(" ");
+            return (
+            <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:12}}
+                 role="img" aria-label="crowding against chance">
+              {[0,0.25,0.5,0.75].filter(v=>v<mx).map(v=>(
+                <g key={v}>
+                  <line className="gl" x1={P.l} x2={W-P.r} y1={y(v)} y2={y(v)}/>
+                  <text className="axis" x={P.l-6} y={y(v)+3} textAnchor="end">{Math.round(v*100)}%</text>
+                </g>))}
+              <path d={pth("chance")} fill="none" stroke="#9aa1a9" strokeWidth="1.8" strokeDasharray="5 4"/>
+              <path d={pth("real")} fill="none" stroke="var(--crowd)" strokeWidth="2.4"/>
+              {L.map(d=>(<g key={d.t}>
+                <circle cx={x(d.t)} cy={y(d.real)} r="3.4" fill="var(--crowd)"/>
+                <circle cx={x(d.t)} cy={y(d.chance)} r="2.6" fill="#9aa1a9"/>
+                <text className="axis" x={x(d.t)} y={H-P.b+15} textAnchor="middle">{d.t}</text>
+              </g>))}
+              <text className="axis" x={W/2} y={H-6} textAnchor="middle">
+                held long by t or more managers — solid is your book, dashed is chance
+              </text>
+            </svg>);})()}
+
+          <table>
+            <thead><tr><th>t</th><th>Share of gross in names held by t+ pods</th>
+              <th>Chance</th><th>Excess</th><th>p</th></tr></thead>
+            <tbody>{res.ladder.map(l=>{
+              const dead=l.real<0.001&&l.chance<0.001;
+              const floored=l.p<=1.5/(nPerm+1);
+              return (
+              <tr key={l.t} style={dead?{opacity:.45}:null}>
+                <td className="v">{l.t}</td>
+                <td className="v">{(l.real*100).toFixed(1)}%</td>
+                <td className="v">{(l.chance*100).toFixed(1)}%</td>
+                <td className={"v "+(!dead&&l.real>l.chance?"pos":"")}>
+                  {dead?"—":((l.real-l.chance>=0?"+":"")+((l.real-l.chance)*100).toFixed(1)+"pp")}</td>
+                <td className="v">{dead?"—":floored?"<"+(1.5/(nPerm+1)).toFixed(3):l.p.toFixed(3)}</td>
+              </tr>);})}
+            </tbody>
+          </table>
+
+          <h2 style={{fontSize:"15px",marginTop:20}}>Most one-way pressure</h2>
+          <p className="note" style={{marginTop:2}}>
+            Each dot is a name. Horizontal is how much the fund holds in it;
+            vertical is how much of that is one-way. A dot on the diagonal is
+            held long by everyone who holds it. A dot well below it has longs
+            and shorts inside the fund that cancel on paper and would not
+            cancel in an exit.
+          </p>
+          {(()=>{
+            const N=res.names, W=700,H=250,P={t:14,r:16,b:40,l:56};
+            const mg=Math.max(...N.map(n=>n.gross))*1.1||1;
+            const x=v=>P.l+(v/mg)*(W-P.l-P.r);
+            const y=v=>P.t+(1-v/mg)*(H-P.t-P.b);
+            const fmt=v=>res.inCash?(v/1e6).toFixed(0)+"m":v.toFixed(2);
+            return (
+            <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:8}}
+                 role="img" aria-label="one-way pressure against gross">
+              <line x1={x(0)} y1={y(0)} x2={x(mg)} y2={y(mg)}
+                    stroke="#c3c8cf" strokeDasharray="4 4"/>
+              {[0.25,0.5,0.75,1].map(f=>(
+                <g key={f}>
+                  <line className="gl" x1={P.l} x2={W-P.r} y1={y(mg*f)} y2={y(mg*f)}/>
+                  <text className="axis" x={P.l-6} y={y(mg*f)+3} textAnchor="end">{fmt(mg*f)}</text>
+                  <text className="axis" x={x(mg*f)} y={H-P.b+15} textAnchor="middle">{fmt(mg*f)}</text>
+                </g>))}
+              {N.map(n=>(
+                <g key={n.ticker}>
+                  <circle cx={x(n.gross)} cy={y(n.press)} r={3+n.n}
+                          fill={n.n>=2?"var(--crowd)":"var(--indep)"}
+                          opacity={n.n>=2?.75:.5}/>
+                  {n.n>=2 && <text className="axis" x={x(n.gross)+6+n.n}
+                                   y={y(n.press)+3}>{n.ticker}</text>}
+                </g>))}
+              <text className="axis" x={W/2} y={H-6} textAnchor="middle">
+                gross exposure — dot size is how many managers are long it
+              </text>
+            </svg>);})()}
+          <table>
+            <thead><tr><th>Ticker</th><th>Pods long</th><th>Long pressure</th>
+              <th>Net</th><th>Gross</th><th>Net / gross</th></tr></thead>
+            <tbody>{res.names.map(n=>{
+              const r=n.gross?n.net/n.gross:0;
+              return (<tr key={n.ticker}>
+                <td className="v">{n.ticker}</td>
+                <td className="v">{n.n}</td>
+                <td className="v">{n.press.toFixed(3)}</td>
+                <td className="v">{n.net.toFixed(3)}</td>
+                <td className="v">{n.gross.toFixed(3)}</td>
+                <td className="v" style={{color:Math.abs(r)<0.5?"var(--crowd)":"inherit"}}>
+                  {Math.round(r*100)}%</td>
+              </tr>);})}
+            </tbody>
+          </table>
+
+          <h2 style={{fontSize:"15px",marginTop:20}}>Most overlapping pairs</h2>
+          {(()=>{
+            const P2=res.pairs.slice(0,8).filter(p=>p.jac>0);
+            if(!P2.length) return null;
+            const mx=Math.max(...P2.map(p=>p.jac));
+            return (
+            <svg viewBox={`0 0 700 ${20+P2.length*22}`}
+                 style={{width:"100%",height:"auto",marginTop:8}}
+                 role="img" aria-label="pairwise overlap">
+              {P2.map((p,i)=>(
+                <g key={i} transform={`translate(0 ${i*22})`}>
+                  <text className="axis" x="0" y="15">{p.a} · {p.b}</text>
+                  <rect x="170" y="4" width={Math.max(2,p.jac/mx*380)} height="13" rx="2"
+                        fill={p.jac>res.floor*2?"var(--crowd)":"#b9bec5"}
+                        opacity={p.jac>res.floor*2?.9:.7}/>
+                  <text className="axis" x={178+Math.max(2,p.jac/mx*380)} y="15">
+                    {(p.jac*100).toFixed(1)}% · {p.shared} names
+                    {res.floor>0?"  ("+(p.jac/res.floor).toFixed(1)+"× the chance floor)":""}
+                  </text>
+                </g>))}
+              <line x1={170+res.floor/mx*380} x2={170+res.floor/mx*380}
+                    y1="0" y2={P2.length*22} stroke="var(--ink)"
+                    strokeDasharray="3 3" opacity=".5"/>
+            </svg>);})()}
+          <p className="note">
+            The dotted line is the chance floor — overlap two unrelated books of
+            this size would show anyway. Bars left of it are arithmetic.
+          </p>
+          <table>
+            <thead><tr><th>Pair</th><th>Shared long names</th><th>Overlap</th>
+              <th>Against the floor</th></tr></thead>
+            <tbody>{res.pairs.slice(0,10).map((p,i)=>(
+              <tr key={i}>
+                <td className="v">{p.a} · {p.b}</td>
+                <td className="v">{p.shared}</td>
+                <td className="v">{(p.jac*100).toFixed(1)}%</td>
+                <td className={"v "+(p.jac>res.floor*2?"neg":"")}>
+                  {res.floor>0?(p.jac/res.floor).toFixed(1)+"×":"—"}</td>
+              </tr>))}
+            </tbody>
+          </table>
+
+          <p className="note">
+            <strong>What positions alone cannot tell you.</strong> The
+            factor separation needs each pod's daily return history, and the
+            unwind needs each name's volatility and a liquidity proxy. Neither
+            is in a position file, so splitting shared factor exposure from
+            genuine crowding, and pricing a forced exit, are not run here. Add
+            returns and the Python pipeline in this repository does both.
+            Saying which half is missing is more use than a number that looks
+            complete and is not.
+          </p>
+        </React.Fragment>
+      )}
+
+      {tRes && (
+        <React.Fragment>
+          <table>
+            <thead><tr><th>Shared cause</th><th>Managers</th><th>Confidence</th></tr></thead>
+            <tbody>{tRes.groups.filter(g=>(g.members||[]).length>1).map((g,i)=>(
+              <tr key={i}>
+                <td>{g.plain}</td>
+                <td>{(g.members||[]).map(m=>(
+                  <span key={m} className="tag t-crowded" style={{marginRight:4}}>
+                    {tRes.pods[m]}</span>))}</td>
+                <td className="v">{g.confidence}</td>
+              </tr>))}
+              {!tRes.groups.filter(g=>(g.members||[]).length>1).length && (
+                <tr><td colSpan="3" className="axis">
+                  No two managers are betting on the same cause. Reported as
+                  found — a grouping pass that never returns a group of one is
+                  a pass that will invent crowding.
+                </td></tr>)}
+            </tbody>
+          </table>
+
+          {(()=>{
+            // Two axes as a picture: every pair placed by how much its books
+            // overlap and whether the managers are making one bet. The top-left
+            // quadrant is the one no position report reaches.
+            const C=tRes.cells.filter(c=>c.jac!==null);
+            if(!C.length) return null;
+            const W=700,H=250,P={t:16,r:16,b:42,l:60};
+            const mx=Math.max(0.1,...C.map(c=>c.jac))*1.15;
+            const x=v=>P.l+(v/mx)*(W-P.l-P.r);
+            const rowY=b=>b?P.t+42:H-P.b-42;
+            return (
+            <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",marginTop:14}}
+                 role="img" aria-label="thesis overlap against book overlap">
+              <line x1={P.l} x2={W-P.r} y1={(rowY(true)+rowY(false))/2}
+                    y2={(rowY(true)+rowY(false))/2} stroke="#dfe3e8"/>
+              <text className="axis" x="0" y={rowY(true)+3}>same bet</text>
+              <text className="axis" x="0" y={rowY(false)+3}>different bets</text>
+              {[0,0.25,0.5,0.75,1].filter(f=>f*mx<=mx).map(f=>(
+                <g key={f}>
+                  <line className="gl" x1={x(mx*f)} x2={x(mx*f)} y1={P.t} y2={H-P.b}/>
+                  <text className="axis" x={x(mx*f)} y={H-P.b+15} textAnchor="middle">
+                    {(mx*f*100).toFixed(0)}%</text>
+                </g>))}
+              {C.map((c,i)=>{
+                const jitter=((i*37)%9-4)*3.2;
+                const latent=c.shared&&c.jac<0.05;
+                return (
+                <g key={i}>
+                  <circle cx={x(c.jac)} cy={rowY(c.shared)+jitter} r={latent?6.5:4}
+                          fill={c.cell==="crowded"?"var(--crowd)":latent?"var(--hl)":"var(--indep)"}
+                          stroke={latent?"var(--ink)":"none"} strokeWidth="1.2"
+                          opacity={c.shared?.95:.45}/>
+                  {c.shared && <text className="axis" x={x(c.jac)+9} y={rowY(true)+jitter+3}>
+                    {c.a} · {c.b}</text>}
+                </g>);})}
+              <text className="axis" x={W/2} y={H-6} textAnchor="middle">
+                share of long book held in common
+              </text>
+            </svg>);})()}
+          <p className="note">
+            Top-left — same bet, books that do not overlap — is the quadrant
+            every chart above this panel is blind to. Top-right is ordinary
+            crowding, and the bottom row is two managers who happen to hold some
+            of the same names without agreeing on anything.
+          </p>
+
+          <table style={{marginTop:16}}>
+            <thead><tr><th>Pair</th><th>Same bet</th><th>Book overlap</th>
+              <th>Reading</th></tr></thead>
+            <tbody>{tRes.cells.filter(c=>c.shared).slice(0,14).map((c,i)=>(
+              <tr key={i}>
+                <td className="v">{c.a} · {c.b}</td>
+                <td className="v">yes</td>
+                <td className="v">{c.jac===null?"no positions loaded":(c.jac*100).toFixed(1)+"%"}</td>
+                <td className={c.cell==="crowded"?"neg":""}>
+                  {c.cell==="crowded"?"same bet, same names — someone cuts"
+                   :c.cell==="latent"?"same bet, different names — watch"
+                   :"same bet, positions unknown"}</td>
+              </tr>))}
+              {!tRes.cells.filter(c=>c.shared).length && (
+                <tr><td colSpan="4" className="axis">No shared bets found.</td></tr>)}
+            </tbody>
+          </table>
+
+          {tRes.months.length>0 && (
+            <React.Fragment>
+              <h2 style={{fontSize:"15px",marginTop:20}}>Catalysts by month</h2>
+              {(()=>{
+                const M=tRes.months, mx=Math.max(...M.map(m=>m.pods));
+                return (
+                <svg viewBox={`0 0 700 ${16+M.length*24}`}
+                     style={{width:"100%",height:"auto",marginTop:8}}
+                     role="img" aria-label="managers waiting per month">
+                  {M.map((m,i)=>(
+                    <g key={m.m} transform={`translate(0 ${i*24})`}>
+                      <text className="axis" x="0" y="16">{m.m}</text>
+                      <rect x="90" y="5" width={Math.max(3,m.pods/mx*430)} height="14" rx="2"
+                            fill={m.pods>=3?"var(--crowd)":"#b9bec5"}
+                            opacity={m.pods>=3?.9:.7}/>
+                      <text className="axis" x={98+Math.max(3,m.pods/mx*430)} y="16">
+                        {m.pods} manager{m.pods>1?"s":""}
+                      </text>
+                    </g>))}
+                </svg>);})()}
+              <p className="note">
+                Several managers waiting on one month is concentration in time.
+                No exposure report shows it, because it is not an exposure — the
+                books can be perfectly diversified and still resolve together.
+              </p>
+            </React.Fragment>
+          )}
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+/* ---------- the text layer ---------- */
+function Thesis({data}){
+  const t=data.thesis;
+  if(!t) return null;
+  const cells=["crowded","latent","coincidental","independent"];
+  const cnt=Object.fromEntries(cells.map(c=>[c,t.pairs.filter(p=>p.cell===c).length]));
+  const mean=(rows,f)=>{const v=rows.map(r=>r[f]).filter(x=>x!=null);
+    return v.length?v.reduce((a,b)=>a+b,0)/v.length:null;};
+  const lat=t.pairs.filter(p=>p.cell==="latent");
+  const cro=t.pairs.filter(p=>p.cell==="crowded");
+  const [sel,setSel]=useState("latent");
+  const shown=t.pairs.filter(p=>p.cell===sel)
+    .sort((a,b)=>b.thesis-a.thesis).slice(0,12);
+  const maxW=Math.max(1,...t.weeks.map(w=>w.pods));
+  const col=ty=>ty==="crowded"?"var(--crowd)":ty==="factor"?"var(--factor)":
+    ty==="independent"?"var(--indep)":"#b9bec5";
+  return (
+    <div className="panel">
+      <h2>What the books cannot show: reading what each manager wrote</h2>
+      <p className="note" style={{marginTop:2}}>
+        Positions are the last thing to converge. A discretionary pod writes a
+        mandate and a thesis before it trades, so managers can reach one
+        conclusion months before their books look alike. Every tool above
+        starts from holdings and is structurally blind to that. Here each pod's
+        written thesis is read by a language model, reduced to a structured
+        claim, and the claims are then grouped by whether the same event in the
+        world would make two managers right or wrong together.
+      </p>
+
+      <div className="grid3" style={{marginTop:16}}>
+        <div className="stat" style={{borderLeftColor:"var(--crowd)"}}>
+          <div className="lbl">same bet, same names</div>
+          <div className="big">{cnt.crowded}</div>
+          <div className="axis">pairs — someone has to cut</div>
+        </div>
+        <div className="stat" style={{borderLeftColor:"var(--hl)"}}>
+          <div className="lbl">same bet, no shared names</div>
+          <div className="big">{cnt.latent}</div>
+          <div className="axis">pairs — invisible to every chart above</div>
+        </div>
+        <div className="stat" style={{borderLeftColor:"var(--indep)"}}>
+          <div className="lbl">shared names, different bets</div>
+          <div className="big">{cnt.coincidental}</div>
+          <div className="axis">pairs — overlap without a common cause</div>
+        </div>
+      </div>
+
+      <div className="bar" style={{marginTop:16}}>
+        <span className="axis">show</span>
+        {cells.map(c=>(
+          <button key={c} className="btn" aria-pressed={sel===c}
+                  onClick={()=>setSel(c)}>{c} ({cnt[c]})</button>
+        ))}
+      </div>
+      <table>
+        <thead><tr><th>Pair</th><th>Thesis overlap</th><th>Book overlap</th>
+          <th>Return corr</th><th>Residual corr</th></tr></thead>
+        <tbody>{shown.map((p,i)=>(
+          <tr key={i}>
+            <td className="v">{p.a} · {p.b}{" "}
+              <span className={"tag t-"+(p.true||"mixed")}
+                    style={{marginLeft:6}}>{p.true}</span></td>
+            <td className="v">{(p.thesis*100).toFixed(0)}%</td>
+            <td className="v">{(p.book*100).toFixed(1)}%</td>
+            <td className="v">{p.raw==null?"—":(p.raw>=0?"+":"")+p.raw.toFixed(3)}</td>
+            <td className="v">{p.resid==null?"—":(p.resid>=0?"+":"")+p.resid.toFixed(3)}</td>
+          </tr>))}
+        </tbody>
+      </table>
+
+      {lat.length>0 && (
+        <p className="note">
+          The <strong>{lat.length} latent pairs</strong> share a bet and hold
+          nothing in common, so no amount of position analysis reaches them.
+          Their mean return correlation is{" "}
+          <strong>{mean(lat,"raw")==null?"—":(mean(lat,"raw")>=0?"+":"")+mean(lat,"raw").toFixed(3)}</strong>{" "}
+          and their mean residual correlation is{" "}
+          <strong>{mean(lat,"resid")==null?"—":(mean(lat,"resid")>=0?"+":"")+mean(lat,"resid").toFixed(3)}</strong>.
+          Read that carefully rather than as a win: high return correlation with
+          a shared thesis and no shared book is what a common <em>factor</em>
+          {" "}looks like. The text found the exposure early, which is useful and
+          is not the same as finding crowding. A high residual would have been
+          the stronger claim, and it is not there.
+        </p>
+      )}
+      <p className="note">
+        Compare with the {cro.length} pairs that share both a bet and a book —
+        mean residual{" "}
+        <strong>{mean(cro,"resid")==null?"—":(mean(cro,"resid")>=0?"+":"")+mean(cro,"resid").toFixed(3)}</strong>.
+        That is crowding: co-movement that survives stripping out the factors,
+        and it is the cell where someone is asked to reduce.
+      </p>
+
+      <hr/>
+      <h2 style={{fontSize:"15px"}}>What the fund is betting on</h2>
+      <table>
+        <thead><tr><th>Shared cause</th><th>Pods</th><th>Who</th></tr></thead>
+        <tbody>{t.groups.filter(g=>g.members.length>1).map((g,i)=>(
+          <tr key={i}>
+            <td>{g.plain}</td>
+            <td className="v">{g.members.length}</td>
+            <td>{g.members.map((m,j)=>(
+              <span key={m} className={"tag t-"+(g.types[j]||"mixed")}
+                    style={{marginRight:4}}>{m}</span>))}</td>
+          </tr>))}
+          <tr>
+            <td colSpan="3" className="axis" style={{paddingTop:8}}>
+              {t.groups.filter(g=>g.members.length===1).length} further pods are
+              each on a cause of their own.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      {t.weeks.length>0 && (
+        <React.Fragment>
+          <hr/>
+          <h2 style={{fontSize:"15px"}}>Concentration in time</h2>
+          <p className="note" style={{marginTop:2}}>
+            Catalysts the managers named, and the week each falls in. Several
+            pods waiting on one date is concentration that no exposure report
+            shows, because it is not an exposure — the books can be perfectly
+            diversified and still resolve together.
+          </p>
+          <svg viewBox={`0 0 700 ${34+t.weeks.length*20}`}
+               style={{width:"100%",height:"auto",marginTop:10}}
+               role="img" aria-label="pods waiting per week">
+            {t.weeks.map((w,i)=>(
+              <g key={w.week} transform={`translate(0 ${i*20})`}>
+                <text className="axis" x="0" y="14">{w.week.slice(0,10)}</text>
+                <rect x="150" y="4" width={Math.max(2,w.pods/maxW*420)} height="12"
+                      fill="var(--crowd)" opacity={w.pods>=3?.85:.35} rx="2"/>
+                <rect x="150" y="4" width={Math.max(1,w.decisive/maxW*420)} height="12"
+                      fill="var(--ink)" opacity=".25" rx="2"/>
+                <text className="axis" x={158+Math.max(2,w.pods/maxW*420)} y="14">
+                  {w.pods} pods · {w.decisive} decisive
+                </text>
+              </g>))}
+          </svg>
+        </React.Fragment>
+      )}
+
+      <p className="note">
+        Theses are written by {t.generated_by} from each pod's real holdings and
+        an assigned driver, because real manager memos are confidential. The
+        macro they cite is invented. Extraction runs {t.n_runs}× per document
+        and the grouping is scored on whether pairs are placed together-or-apart
+        identically across runs — not on whether the groups get the same names,
+        since a second run may name a group differently and still be right.
+        An earlier version asked each document, in isolation, to invent a label
+        that would coincidentally match another document's label; it agreed with
+        itself on 8 pods of 20, and the five pods on one datacenter bet produced
+        five different labels. Comparison works where coincidental naming cannot.
+      </p>
+    </div>
+  );
+}
+
 /* ---------- 4. the unwind ---------- */
 function Unwind({data}){
   const u=data.unwind;
@@ -494,8 +1613,11 @@ function App(){
       <PodTable pods={d.pods}/>
       <Separation data={d}/>
       <Ladder data={d}/>
+      <Grid data={d}/>
       <Unwind data={d}/>
       <NetGross data={d}/>
+      <Thesis data={d}/>
+      <Upload/>
       <p className="foot">
         {m.n_pods} pods over {m.n_days.toLocaleString()} trading days ({m.start} to {m.end}),
         {" "}{m.n_eras} quarterly rebalances, {m.n_pairs} pairs.
