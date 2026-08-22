@@ -7,8 +7,9 @@ constructed to crowd into a shared basket. Five hold no name in common with
 each other but load on the same factor. Ranked by return correlation, the
 second group looks like the problem and the first is invisible.
 
-The five that get missed cost **7×** more than an independent pod when one of
-them is forced to liquidate.
+The five that get missed are the expensive ones to lose. Across the five most
+crowded eras, liquidating one costs the rest of the fund between **4.6× and
+13.8×** what liquidating an independent pod costs.
 
 ---
 
@@ -36,19 +37,22 @@ Forced liquidation, averaged over every pod of each type:
 
 ```
   pod liquidated      mean cost to the other 19
-  crowded                   -9.44m
-  factor                    -3.56m
-  independent               -1.27m
+  crowded                  -15.45m
+  independent               -3.38m
+  factor                    -3.02m
 ```
 
 The detector picks its victim from **holdings alone, never from the labels**.
 It picked a planted crowded pod.
 
-The multiple is roughly 7× here and was 15× on a different random seed, because
-the stress test runs in whichever era is most crowded and the mid-1990s eras
-are similar but not identical. Treat the multiple as a magnitude, not a
-measurement: what is stable across seeds is that crowded pods are the expensive
-ones to lose, not the precise factor.
+**The multiple is not a stable quantity**, and the project reports it as a
+range for that reason. Run the same control in each of the five most crowded
+eras and it lands at 4.6×, 5.0×, 6.3×, 7.4× and 13.8× — median 6.3×, and a
+three-fold spread between the ends. A single era's figure
+looks precise and does not reproduce in the next one. What survives every era
+tested is the ordering: crowded pods are always the costly ones to lose, factor
+pods the cheapest. Quoting one era's multiple as a headline would be quoting
+noise to two significant figures.
 
 ---
 
@@ -140,6 +144,14 @@ which book. That is the right null for a pair statistic and mathematically
 useless for a name one — reassigning whole books between pods leaves every
 column sum untouched, so fund-level exposure per name cannot move. It printed a
 null mean equal to the real value to four decimals, and p exactly 1.0000.
+
+**Two definitions of one thing.** The unwind script ranked eras by the count of
+names held by three or more pods; the web exporter ranked them by the share of
+gross book in those names. Both are defensible and they select different
+quarters, so the terminal output and the dashboard named different victims and
+different multiples for what was described as the same test. Caught by reading
+the deployed page against the terminal. One definition now lives in one
+function and both import it.
 
 **A control that reproduced the treatment.** `--random-pod` liquidated one
 randomly chosen pod. With five of twenty planted crowded, a single draw lands
