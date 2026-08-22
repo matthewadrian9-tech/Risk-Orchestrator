@@ -303,6 +303,10 @@ function Unwind({data}){
   const mult=cr&&ind&&ind.mean_damage!==0
     ? Math.abs(cr.mean_damage/ind.mean_damage) : null;
   const worst=Math.min(...ctrl.map(c=>c.mean_damage));
+  const ae=(u.across_eras||[]).filter(r=>r.multiple!=null);
+  const ms=ae.map(r=>r.multiple).sort((a,b)=>a-b);
+  const lo=ms[0], hi=ms[ms.length-1];
+  const med=ms.length%2?ms[(ms.length-1)/2]:(ms[ms.length/2-1]+ms[ms.length/2])/2;
   return (
     <div className="panel">
       <h2>What it costs when one of them is forced out</h2>
@@ -351,14 +355,40 @@ function Unwind({data}){
       </svg>
       {mult && (
         <p className="note">
-          Liquidating a crowded pod costs the rest of the fund{" "}
+          In this era, liquidating a crowded pod costs the rest of the fund{" "}
           <strong>{mult.toFixed(1)}×</strong> what liquidating an independent one
           costs. Averaged over every pod of each type, so no single unlucky draw
           decides it. Liquidating a factor pod is{" "}
-          {ctrl.find(c=>c.type==="factor")?.mean_damage>0?"profitable":"cheap"}{" "}
+          {ctrl.find(c=>c.type==="factor")?.mean_damage>0?"profitable":"cheaper"}{" "}
           for everyone else — the pods short those names collect what the seller
           gives up.
         </p>
+      )}
+      {ae.length>1 && (
+        <React.Fragment>
+          <table>
+            <thead><tr><th>Era</th><th>Crowded pod out</th>
+              <th>Independent pod out</th><th>Multiple</th></tr></thead>
+            <tbody>{ae.map(r=>(
+              <tr key={r.era}>
+                <td className="v">{r.era}</td>
+                <td className="v neg">{usd(r.crowded)}</td>
+                <td className={"v "+(r.independent<0?"neg":"pos")}>{usd(r.independent)}</td>
+                <td className="v"><strong>{r.multiple==null?"—":r.multiple.toFixed(1)+"×"}</strong></td>
+              </tr>))}
+            </tbody>
+          </table>
+          <p className="note">
+            <strong>The multiple is not a stable quantity.</strong> Across the
+            five most crowded eras it runs from {lo.toFixed(1)}× to {hi.toFixed(1)}×,
+            median {med.toFixed(1)}×. Any single era's figure looks precise and
+            will not reproduce in the next one, so the honest claim is the
+            ordering rather than the number: whichever era you pick, the crowded
+            pods are the expensive ones to lose. A version of this page quoting
+            one era's multiple as the headline would have been quoting noise to
+            two significant figures.
+          </p>
+        </React.Fragment>
       )}
       <table>
         <thead><tr><th>Impact coefficient</th><th>Seller</th>

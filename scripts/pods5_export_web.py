@@ -38,7 +38,9 @@ from pods2_crowding import (  # noqa: E402
     benjamini_hochberg, overlap_stats, pair_pvalues, residualise, stock_factors,
 )
 from pods3_exposure import era_weights, eligible_by_era, fund_stats  # noqa: E402
-from pods4_unwind import era_books, name_stats, pick_victim, unwind  # noqa: E402
+from pods4_unwind import (  # noqa: E402
+    era_books, name_stats, pick_victim, rank_eras, unwind,
+)
 
 
 def jsonable(x):
@@ -62,6 +64,7 @@ def main():
     ap.add_argument("--resid-window", type=int, default=63)
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--min-pods", type=int, default=3)
+    ap.add_argument("--n-eras", type=int, default=5)
     ap.add_argument("--turnover", type=float, default=0.005)
     ap.add_argument("--nav", type=float, default=100e6)
     ap.add_argument("--coefficients", type=float, nargs="+",
@@ -197,7 +200,12 @@ def main():
                               "chance": jsonable(nl.mean()), "p": jsonable(p)})
 
     # --------------------------------------------------------- worst era
-    worst = max(per_era, key=lambda e: per_era[e][2]["crowded_share"])
+    # The SAME ranking pods4 uses. These two scripts briefly disagreed about
+    # which era was "most crowded" - one counted names, the other weighted by
+    # gross book - so the terminal and the dashboard named different victims
+    # and different multiples for what was described as one test.
+    ranked = [e for e in rank_eras(holds, eras, a.min_pods) if e in per_era]
+    worst = ranked[0]
     W, names, st = per_era[worst]
     order = np.argsort(-st["long_press"])[:14]
     out["worst_era"] = {
@@ -243,7 +251,27 @@ def main():
             "total": sum(others_v.values()),
             "worst": min(others_v.values()),
             "n_hurt": sum(1 for x in others_v.values() if x < 0)})
+    # the multiple across several eras, because one era's figure is not stable
+    across = []
+    for e in ranked[:a.n_eras]:
+        i2 = eras.index(e)
+        s0 = pd.Timestamp(e)
+        s1 = pd.Timestamp(eras[i2 + 1]) if i2 + 1 < len(eras) else s0 + pd.Timedelta(days=90)
+        v2, c2 = name_stats(panel, s0, s1)
+        bk = era_books(holds, pods, e)
+        agg = {}
+        for v in pods:
+            pl, _ = unwind(bk, v, pods, v2, c2, mid, a.turnover, a.nav)
+            agg.setdefault(ty.get(v, "?"), []).append(
+                sum(x for p, x in pl.items() if p != v))
+        cr2 = float(np.mean(agg.get("crowded", [np.nan])))
+        in2 = float(np.mean(agg.get("independent", [np.nan])))
+        across.append({"era": str(e), "crowded": jsonable(cr2),
+                       "independent": jsonable(in2),
+                       "multiple": jsonable(abs(cr2 / in2) if in2 else np.nan)})
+
     out["unwind"] = {
+        "across_eras": across,
         "era": str(worst), "victim": victim, "overlap_score": jsonable(score),
         "victim_true_type": ty.get(victim, ""),
         "coefficient_sweep": sweep, "control_coef": mid,

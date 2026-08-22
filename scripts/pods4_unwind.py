@@ -77,6 +77,38 @@ import numpy as np
 import pandas as pd
 
 
+def rank_eras(holds, eras, min_pods=3):
+    """Eras ordered by how crowded they are, most first.
+
+    ONE definition, exported, because there were briefly two. This script
+    ranked eras by the count of names held by three or more pods, while the
+    web exporter ranked them by the share of gross book in those names. Both
+    are reasonable and they pick different quarters, so the terminal output and
+    the dashboard reported different victims and different multiples for what
+    was described as the same test. A project with two answers to one question
+    has a bug regardless of which answer is better.
+
+    The share of gross book wins: a count of names says nothing about how much
+    capital is behind them.
+    """
+    scored = []
+    for e in eras:
+        h = holds[(holds["era"] == e) & (holds["side"] == "long")]
+        if h.empty:
+            continue
+        cnt = h.groupby("permno")["pod"].nunique()
+        crowded = set(cnt[cnt >= min_pods].index)
+        if not crowded:
+            scored.append((0.0, e))
+            continue
+        per = h.groupby("pod")["permno"].count()
+        share = sum(1.0 / per[p] for p, n in zip(h["pod"], h["permno"])
+                    if n in crowded) / max(len(per), 1)
+        scored.append((share, e))
+    scored.sort(reverse=True)
+    return [e for _, e in scored]
+
+
 def era_books(holds, pods, era):
     h = holds[holds["era"] == era]
     out = {}
@@ -157,6 +189,10 @@ def main():
                     help="era start date; default is the most crowded era")
     ap.add_argument("--pod", default=None, help="force a specific pod to liquidate")
     ap.add_argument("--random-pod", action="store_true")
+    ap.add_argument("--min-pods", type=int, default=3,
+                    help="a name is crowded when this many pods are long it")
+    ap.add_argument("--n-eras", type=int, default=5,
+                    help="how many of the most crowded eras to report the multiple across")
     ap.add_argument("--coefficients", type=float, nargs="+",
                     default=[0.1, 0.3, 1.0, 3.0])
     ap.add_argument("--turnover", type=float, default=0.005,
@@ -171,17 +207,11 @@ def main():
     eras = sorted(holds["era"].unique())
     rng = np.random.default_rng(a.seed)
 
-    # choose the era: the one with the most names held by 3+ pods
+    ranked = rank_eras(holds, eras, a.min_pods)
     if a.era:
         era = a.era
     else:
-        best, era = -1, eras[0]
-        for e in eras:
-            h = holds[(holds["era"] == e) & (holds["side"] == "long")]
-            cnt = h.groupby("permno")["pod"].nunique()
-            score = int((cnt >= 3).sum())
-            if score > best:
-                best, era = score, e
+        era = ranked[0]
     i = eras.index(era)
     era_start = pd.Timestamp(era)
     era_end = pd.Timestamp(eras[i + 1]) if i + 1 < len(eras) else era_start + pd.Timedelta(days=90)
@@ -304,6 +334,42 @@ def main():
             print(f"  {abs(np.mean(cr))/max(abs(np.mean(ind)), 1e-9):.1f}x what liquidating an independent one costs.")
             print("  Averaged over every pod of each type, so no single unlucky")
             print("  draw decides it.")
+
+    # ------------------------------------------- the multiple across eras
+    # A single era gives a single number, and that number is not stable: the
+    # same test run on three different crowded eras returned 4.6x, 7.4x and
+    # 14.8x. Quoting any one of them implies a precision the method does not
+    # have. What IS stable is the ordering, and the way to show that is to run
+    # the control in several eras and print the spread.
+    if ty and not a.pod and not a.random_pod and a.n_eras > 1:
+        print("\n" + "=" * 76)
+        print(f"THE MULTIPLE ACROSS THE {a.n_eras} MOST CROWDED ERAS")
+        print("=" * 76)
+        print(f"  {'era':<14}{'crowded':>12}{'independent':>14}{'multiple':>11}")
+        mults = []
+        for e in ranked[:a.n_eras]:
+            i2 = eras.index(e)
+            s0 = pd.Timestamp(e)
+            s1 = pd.Timestamp(eras[i2 + 1]) if i2 + 1 < len(eras) else s0 + pd.Timedelta(days=90)
+            v2, c2 = name_stats(panel, s0, s1)
+            bk = era_books(holds, pods, e)
+            agg = {}
+            for v in pods:
+                pl, _ = unwind(bk, v, pods, v2, c2, mid, a.turnover, a.nav)
+                agg.setdefault(ty.get(v, "?"), []).append(
+                    sum(x for p, x in pl.items() if p != v))
+            cr2 = np.mean(agg.get("crowded", [np.nan]))
+            in2 = np.mean(agg.get("independent", [np.nan]))
+            mlt = abs(cr2 / in2) if in2 else np.nan
+            mults.append(mlt)
+            print(f"  {str(e):<14}{cr2/1e6:>11.2f}m{in2/1e6:>13.2f}m"
+                  f"{mlt:>10.1f}x")
+        mm = [x for x in mults if np.isfinite(x)]
+        if mm:
+            print(f"\n  range {min(mm):.1f}x to {max(mm):.1f}x, median {np.median(mm):.1f}x")
+            print("  The multiple moves with the era; the ordering does not.")
+            print("  Report the range, not a point estimate - a single era's")
+            print("  figure looks precise and is not reproducible in the next one.")
 
     print("\n" + "=" * 76)
     print("READING THIS")
