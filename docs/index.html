@@ -277,9 +277,8 @@ function Ladder({data}){
         <strong> less-than</strong>, no permutation out of {data.meta.n_perm}
         {" "}ever reached the real value, so the figure is the resolution of the
         null rather than a measurement — the true p could be far smaller and the
-        printed number would be identical. Reporting {(1/(data.meta.n_perm+1)).toFixed(3)}
-        {" "}on several rows at once would be reporting the number of draws as if
-        it were several separate findings.
+        printed number would be identical. Several rows carrying that same bound is one
+        fact about the number of draws, not several separate findings.
       </p>
       <p className="note">
         The dashed line is why this chart exists. {pctf(L[0].real)} of the book
