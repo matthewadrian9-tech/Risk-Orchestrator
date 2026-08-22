@@ -1713,15 +1713,21 @@ FERC queue data, December.`}
               {P2.map((p,i)=>(
                 <g key={i} transform={`translate(0 ${i*22})`}>
                   <text className="axis" x="0" y="15">{p.a} · {p.b}</text>
-                  <rect x="170" y="4" width={Math.max(2,p.jac/mx*380)} height="13" rx="2"
+                  <rect x="170" y="4" width={Math.max(2,p.jac/mx*280)} height="13" rx="2"
                         fill={p.jac>res.floor*2?"var(--crowd)":"#b9bec5"}
                         opacity={p.jac>res.floor*2?.9:.7}/>
-                  <text className="axis" x={178+Math.max(2,p.jac/mx*380)} y="15">
+                  {/* The bar ran to 380px and the label started after it, so a
+                      long label on a full-width bar was cut off by the right
+                      edge of the viewBox - the widest bar, which is always the
+                      most crowded pair, was the one whose text got truncated.
+                      Bar shortened and label abbreviated so the worst case
+                      fits. */}
+                  <text className="axis" x={178+Math.max(2,p.jac/mx*280)} y="15">
                     {(p.jac*100).toFixed(1)}% · {p.shared} names
-                    {res.floor>0?"  ("+(p.jac/res.floor).toFixed(1)+"× the chance floor)":""}
+                    {res.floor>0?" · "+(p.jac/res.floor).toFixed(1)+"× floor":""}
                   </text>
                 </g>))}
-              <line x1={170+res.floor/mx*380} x2={170+res.floor/mx*380}
+              <line x1={170+res.floor/mx*280} x2={170+res.floor/mx*280}
                     y1="0" y2={P2.length*22} stroke="var(--ink)"
                     strokeDasharray="3 3" opacity=".5"/>
             </svg>);})()}
