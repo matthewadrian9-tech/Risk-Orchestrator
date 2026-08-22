@@ -766,10 +766,30 @@ function Upload(){
           }
         pairs.sort((x,y)=>y.jac-x.jac);
 
-        const names=Object.keys(gross).map(k=>({
+        // RANKING BY DOLLAR EXPOSURE DROPPED WHOLE MANAGERS. The grid took the
+        // top 15 names by pressure, and pressure is a currency figure, so the
+        // smallest book contributes the smallest per-name exposure and its
+        // names fall off the bottom. On the demo pack the two smallest
+        // managers ($180m and $150m against $400m) had NO name in the top 15
+        // and rendered as entirely blank rows - which reads as "holds nothing"
+        // rather than "holds nothing large enough to make this list".
+        //
+        // Every manager is now guaranteed their largest position in the grid,
+        // appended to the ranked list if it did not already make the cut.
+        const allNames=Object.keys(gross).map(k=>({
           ticker:k, net:net[k], gross:gross[k],
           press:press[k]||0, n:nLong[k]||0}))
-          .sort((x,y)=>y.press-x.press).slice(0,15);
+          .sort((x,y)=>y.press-x.press);
+        const shown=new Set(allNames.slice(0,15).map(n=>n.ticker));
+        pods.forEach(p=>{
+          const mine=[...(longsBy[p]||[])];
+          if(!mine.length || mine.some(t=>shown.has(t))) return;
+          const biggest=mine.map(t=>allNames.find(n=>n.ticker===t))
+                            .filter(Boolean)
+                            .sort((x,y)=>y.press-x.press)[0];
+          if(biggest) shown.add(biggest.ticker);
+        });
+        const names=allNames.filter(n=>shown.has(n.ticker));
 
         // per-manager summary
         const mgr=pods.map(p=>{
@@ -783,8 +803,15 @@ function Upload(){
                       (inCash? (mine[0].nominal/ (mine[0].weight||1)) : null)};
         });
 
-        // grid: manager against the most-pressured names
-        const gridNames=names.slice(0,16).map(n=>n.ticker);
+        // grid: manager against the most-pressured names.
+        //
+        // NO SECOND CUT HERE. `names` has already been built to guarantee every
+        // manager at least one column, and re-slicing it to a fixed 16 undid
+        // that for whoever was appended last - on the demo pack it restored one
+        // blank manager row after the first fix had removed two. A cap that
+        // silently discards the thing a previous step deliberately added is
+        // worse than no cap.
+        const gridNames=names.map(n=>n.ticker);
         const grid=pods.map(p=>({pod:p, cells:gridNames.map(t=>{
           const r=rows.find(x=>x.pod===p&&x.ticker===t);
           return r?(r.side==="long"?1:-1):0;
@@ -970,9 +997,20 @@ function Upload(){
       // The fix is the anchor, not a firmer instruction. The as-of date is
       // the last date in the returns bundle when there is one, so catalysts
       // resolve against the same window the returns cover.
-      const asOf=(bundle&&bundle.dates&&bundle.dates.length)
-                 ? bundle.dates[bundle.dates.length-1]
-                 : new Date().toISOString().slice(0,10);
+      // FALLING BACK TO TODAY MADE THE CALENDAR DRIFT. When a returns bundle
+      // is present the as-of date comes from it and is fixed. When it is not -
+      // which is the case on the published site, where the bundle is withheld
+      // for licensing - the fallback was the system clock, so every catalyst
+      // resolved relative to whenever the page happened to be opened. Loading
+      // it in one month and the next produced different calendars from
+      // identical documents, which is the same defect as the unseeded null
+      // wearing different clothes.
+      //
+      // The fallback is now a fixed date rather than a moving one, and the
+      // page states which date it used either way.
+      const asOfFromData=!!(bundle&&bundle.dates&&bundle.dates.length);
+      const asOf=asOfFromData ? bundle.dates[bundle.dates.length-1]
+                              : "2024-12-31";
       const ext={};
       for(let i=0;i<pods.length;i++){
         setTBusy(`reading ${pods[i]} (${i+1}/${pods.length})`);
@@ -1035,6 +1073,7 @@ function Upload(){
         (byWeek[w]=byWeek[w]||new Set()).add(c.pod); });
 
       setTRes({ext, groups:cl.groups||[], cells, pods, cal, multi,
+               asOf, asOfFromData,
                months:Object.entries(byWeek).map(([m,v])=>({m,pods:v.size}))
                  .sort((x,y)=>x.m<y.m?-1:1)});
       setTBusy("");
@@ -1906,6 +1945,19 @@ FERC queue data, December.`}
                 Dates now resolve forward from the last date in the returns
                 data, and genuinely vague timing returns null rather than a
                 guess.
+              </p>
+              <p className="note">
+                Catalysts here resolve forward from{" "}
+                <strong>{tRes.asOf}</strong>
+                {tRes.asOfFromData
+                  ? ", the last date in the returns data."
+                  : ", a fixed default, because no returns data is loaded to "
+                    +"take a date from. It is deliberately fixed rather than "
+                    +"today's date: an earlier version used the system clock, "
+                    +"so identical documents produced a calendar that moved "
+                    +"forward every day the page sat unopened. Upload a book "
+                    +"whose names resolve against a returns bundle and the "
+                    +"anchor comes from the data instead."}
               </p>
             </React.Fragment>
           )}
