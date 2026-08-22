@@ -1,4 +1,5 @@
-﻿data/
-outputs/
+﻿/data/
+/outputs/
 __pycache__/
 *.pyc
+!docs/data/
