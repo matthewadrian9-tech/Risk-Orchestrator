@@ -216,6 +216,111 @@ function Separation({data}){
   );
 }
 
+/* ---------- 2b. VaR, and the same reversal inside it ---------- */
+function VaR({data}){
+  const v=data.var;
+  if(!v||!v.by_type||!v.by_type.length) return null;
+  const pct=x=>(x*100).toFixed(2)+"%";
+  const cash=x=>(x*v.nav/1e6).toFixed(1)+"m";
+  const label={crowded:"crowded",factor:"factor",independent:"independent"};
+  return (
+    <div className="panel">
+      <h2>What the number every fund reports says about the same pods</h2>
+      <p className="note">
+        Value at Risk is the measure a risk committee reads daily: on the worst
+        day in twenty, how much does the fund lose. It is here because a
+        crowding tool should be tested against the instrument a desk already
+        uses, not only against a bespoke one.
+      </p>
+
+      <div className="grid3" style={{marginTop:14}}>
+        <div><div className="axis">VALUE AT RISK, {(v.alpha*100).toFixed(0)}%</div>
+          <div className="big">{pct(v.var)}</div>
+          <div className="axis">{cash(v.var)} on {(v.nav/1e6).toFixed(0)}m</div></div>
+        <div><div className="axis">EXPECTED SHORTFALL</div>
+          <div className="big">{pct(v.es)}</div>
+          <div className="axis">mean loss beyond the threshold</div></div>
+        <div><div className="axis">ES / VaR</div>
+          <div className="big">{v.es_over_var.toFixed(2)}</div>
+          <div className="axis">a normal distribution gives ~1.25</div></div>
+      </div>
+
+      <p className="note">
+        A ratio of {v.es_over_var.toFixed(2)} against a normal distribution's
+        1.25 means the losses beyond the threshold are worse than a parametric
+        model would report — the argument for real returns rather than
+        simulated ones, since a simulated covariance structure would have
+        smoothed that tail away invisibly. Worst single day: {pct(v.worst_day)}.
+      </p>
+
+      <h2 style={{fontSize:"15px",marginTop:22}}>Which pods the VaR blames</h2>
+      <table>
+        <thead><tr><th>Pod type</th><th className="v">Pods</th>
+          <th className="v">Capital</th><th className="v">VaR share</th>
+          <th className="v">Per capital</th>
+          <th className="v">Residual VaR</th><th className="v">Per capital</th>
+        </tr></thead>
+        <tbody>
+          {v.by_type.map(d=>(
+            <tr key={d.type}>
+              <td><span className={"tag t-"+d.type}>{label[d.type]}</span></td>
+              <td className="v">{d.n}</td>
+              <td className="v">{(d.cap_share*100).toFixed(0)}%</td>
+              <td className="v">{(d.var_share*100).toFixed(1)}%</td>
+              <td className={"v "+(d.var_per_cap>1.2?"neg":"")}>
+                {d.var_per_cap.toFixed(2)}×</td>
+              <td className="v">{(d.res_share*100).toFixed(1)}%</td>
+              <td className={"v "+(d.res_per_cap>1.2?"neg":"")}>
+                {d.res_per_cap.toFixed(2)}×</td>
+            </tr>))}
+        </tbody>
+      </table>
+
+      <p className="note">
+        <strong>Per capital</strong> is share of risk divided by share of money.
+        A group at 1.00 carries exactly its size and is telling you nothing.
+      </p>
+
+      {v.rankings_disagree ? (
+        <React.Fragment>
+          <p className="note">
+            <strong>Ranked by raw VaR: {v.rank_raw.join(" › ")}. After the{" "}
+            {v.k_factors} factors come out: {v.rank_res.join(" › ")}.</strong>{" "}
+            Raw VaR blames the factor pods, because VaR is a statement about the
+            variance of the fund's total return and those pods correlate at
+            +0.76. They are also the cheapest pods in the fund to lose — they
+            hold no name in common, so a forced exit puts nobody into the same
+            bid. Remove the factors and what they shared leaves with it, while
+            what the crowded pods share stays. Same reversal as the pair
+            correlations above, through an entirely different statistic.
+          </p>
+          <p className="note">
+            A desk ranking on the standard number and a desk ranking on the
+            corrected one would call in different managers, from the same fund,
+            on the same day.
+          </p>
+        </React.Fragment>
+      ) : (
+        <p className="note">
+          Both rankings agree here, before and after factors are removed. That is
+          worth stating plainly rather than omitting: on this run VaR is not
+          telling a different story from the residual measure, so it neither
+          supports nor contradicts the reversal the pair correlations show.
+        </p>
+      )}
+
+      <p className="note">
+        <strong>What VaR cannot see.</strong> It answers from the covariance of
+        returns and is silent about who holds what. Six managers holding six
+        disjoint baskets look diversified to it, and go on looking diversified
+        right up to the morning they all sell for the same reason. The loss then
+        is not a price move — it is the cost of the exit, and that depends on
+        the overlap of the books, not the covariance of the returns.
+      </p>
+    </div>
+  );
+}
+
 /* ---------- 3. concentration against chance ---------- */
 function Ladder({data}){
   const all=data.ladder;
@@ -950,8 +1055,48 @@ function Upload(){
               });
               return {pod:p, damage:hit};
             }).sort((x,y)=>x.damage-y.damage);
+            // VaR, so this panel runs the same analysis as the precomputed
+            // section rather than a subset of it. Equal capital weights,
+            // because a position file carries no allocation - stated below
+            // rather than hidden, since a real fund's weights would change the
+            // decomposition.
+            const vN=covered.length;
+            const wq=1/vN;
+            const fundR=series[covered[0]].map((_,i)=>
+              covered.reduce((acc,p)=>acc+series[p][i]*wq,0));
+            const residR=series[covered[0]].map((_,i)=>
+              covered.reduce((acc,p)=>acc+resid[p][i]*wq,0));
+            const varOf=(x)=>{
+              const srt=[...x].sort((a,b)=>a-b);
+              const q=srt[Math.floor(srt.length*0.05)];
+              const tail=srt.filter(v=>v<=q);
+              return {v:-q, es:-(tail.reduce((a,b)=>a+b,0)/(tail.length||1))};
+            };
+            const compOf=(M,vf)=>{
+              const rf=M===resid?residR:fundR;
+              const mu=rf.reduce((a,b)=>a+b,0)/rf.length;
+              const vv=rf.reduce((a,b)=>a+(b-mu)*(b-mu),0)/(rf.length-1);
+              const o={};
+              covered.forEach(p=>{
+                const x=M[p], mx=x.reduce((a,b)=>a+b,0)/x.length;
+                let c=0; for(let i=0;i<x.length;i++) c+=(x[i]-mx)*(rf[i]-mu);
+                c/=(x.length-1);
+                o[p]=vv>0? wq*c/vv*vf : 0;
+              });
+              return o;
+            };
+            const fv=varOf(fundR), rv=varOf(residR);
+            const cRaw=compOf(series,fv.v), cRes=compOf(resid,rv.v);
+            const varSummary={
+              alpha:0.95, var:fv.v, es:fv.es, esOverVar:fv.es/fv.v,
+              worst:-Math.min(...fundR), equalWeighted:true,
+              byPod:covered.map(p=>({pod:p,
+                share:cRaw[p]/fv.v, resShare:cRes[p]/rv.v}))
+                .sort((a,b)=>b.share-a.share)
+            };
+
             ret={pairs:cp, stats, unwind:un, covered:covered.length,
-                 total:pods.length, meanCov, k, nullMeta,
+                 total:pods.length, meanCov, k, nullMeta, varSummary,
                  factors:bundle.factor_names.slice(0,k), days:bundle.dates.length};
           } else {
             ret={insufficient:true, meanCov, total:pods.length,
@@ -1492,6 +1637,51 @@ FERC queue data, December.`}
                 tests is <em>independence</em>, and books that still share
                 unmodelled exposure are not independent.
               </p>
+
+              {R2.varSummary && (
+                <React.Fragment>
+                  <h2 style={{fontSize:"15px",marginTop:22}}>Value at Risk</h2>
+                  <p className="note">
+                    The worst day in twenty, from the actual return history of
+                    these books rather than from a normal distribution. VaR{" "}
+                    <strong>{(R2.varSummary.var*100).toFixed(2)}%</strong>,
+                    expected shortfall{" "}
+                    <strong>{(R2.varSummary.es*100).toFixed(2)}%</strong>, a
+                    ratio of {R2.varSummary.esOverVar.toFixed(2)} against about
+                    1.25 for a normal distribution. Worst single day in the
+                    sample, {(R2.varSummary.worst*100).toFixed(2)}%.
+                  </p>
+                  <p className="note">
+                    <strong>Managers are weighted equally, because a position
+                    file does not say how the fund allocates.</strong> Real
+                    weights would change every number in this table, so read the
+                    ordering rather than the levels.
+                  </p>
+                  <table>
+                    <thead><tr><th>Manager</th>
+                      <th className="v">Share of VaR</th>
+                      <th className="v">After factors removed</th></tr></thead>
+                    <tbody>
+                      {R2.varSummary.byPod.map(d=>(
+                        <tr key={d.pod}>
+                          <td>{d.pod}</td>
+                          <td className="v">{(d.share*100).toFixed(1)}%</td>
+                          <td className={"v "+(d.resShare>d.share?"neg":"")}>
+                            {(d.resShare*100).toFixed(1)}%</td>
+                        </tr>))}
+                    </tbody>
+                  </table>
+                  <p className="note">
+                    A manager whose share <em>rises</em> once factors are
+                    removed is carrying risk that is their own rather than the
+                    market's — those rows are marked. A manager whose share
+                    falls was mostly contributing shared exposure, which a fund
+                    can hedge centrally without asking anyone to change a
+                    position. VaR alone does not distinguish the two, which is
+                    the reason for the second column.
+                  </p>
+                </React.Fragment>
+              )}
 
               <h2 style={{fontSize:"15px",marginTop:20}}>Priced unwind</h2>
               <table>
@@ -2320,7 +2510,10 @@ function App(){
   return (
     <div className="wrap">
       <div className="kicker">multi-manager risk · crsp 1993–2024 · simulated pods, real returns</div>
-      <h1>The correlation matrix points at the wrong five pods</h1>
+      <h1>Risk Orchestrator</h1>
+      <p className="lede" style={{fontWeight:600,marginBottom:10}}>
+        The correlation matrix points at the wrong five pods.
+      </p>
       <p className="lede">
         Twenty long/short books built from real CRSP returns. Five were
         constructed to crowd into a shared basket; five hold no name in common
@@ -2331,6 +2524,7 @@ function App(){
       <hr/>
       <PodTable pods={d.pods}/>
       <Separation data={d}/>
+      <VaR data={d}/>
       <Ladder data={d}/>
       <Grid data={d}/>
       <Unwind data={d}/>

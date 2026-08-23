@@ -116,6 +116,79 @@ def main():
     keep_ov = benjamini_hochberg(p_ov, a.alpha)
     raw_corr = R.corr().to_numpy()
 
+    # ------------------------------------------------------------- VaR
+    # THE SAME REVERSAL, IN THE NUMBER FUNDS ACTUALLY REPORT.
+    #
+    # Everything else on this page is a crowding statistic, and a risk
+    # committee could reasonably ask why it should care about a measure it does
+    # not currently run. So the fund's Value at Risk is computed here and
+    # decomposed by pod type, twice: on raw returns and on returns with common
+    # factor exposure removed.
+    #
+    # Component VaR uses the standard identity
+    #     component_i = w_i * cov(r_i, r_fund) / var(r_fund) * VaR_fund
+    # which sums to the fund VaR exactly - the property that makes it
+    # attributable. Note that ddof must match between the covariance and the
+    # variance or the parts stop summing to the whole; numpy defaults differ
+    # (cov is ddof=1, var is ddof=0) and mixing them scales every component by
+    # n/(n-1).
+    #
+    # This is arithmetic and there is no AI in it. It is here because it tests
+    # the project's claim against the industry's own instrument rather than
+    # only against a correlation matrix.
+    w_eq = np.repeat(1.0 / m, m)
+
+    def _var_es(x, alpha):
+        q = np.quantile(x, 1.0 - alpha)
+        tail = x[x <= q]
+        return -float(q), (-float(tail.mean()) if len(tail) else float("nan"))
+
+    def _component(M, var_fund):
+        rf = M.to_numpy() @ w_eq
+        v = float(np.var(rf, ddof=1))
+        if v <= 0:
+            return pd.Series(0.0, index=M.columns)
+        X = M.to_numpy() - M.to_numpy().mean(axis=0)
+        y = rf - rf.mean()
+        return pd.Series(w_eq * (X.T @ y / (len(y) - 1)) / v * var_fund,
+                         index=M.columns)
+
+    r_fund = R.to_numpy() @ w_eq
+    var_f, es_f = _var_es(r_fund, 0.95)
+    comp_raw = _component(R, var_f)
+    E_var = residualise(R, F, max(a.factors), a.resid_window)
+    var_r, _ = _var_es(E_var.to_numpy() @ w_eq, 0.95)
+    comp_res = _component(E_var, var_r)
+
+    var_types = []
+    for t in ["crowded", "factor", "independent"]:
+        mem = [p_ for p_ in pods if ty.get(p_) == t]
+        if not mem:
+            continue
+        cap = len(mem) / m
+        vs = float(comp_raw[mem].sum() / var_f)
+        rs = float(comp_res[mem].sum() / var_r)
+        var_types.append({"type": t, "n": len(mem), "cap_share": cap,
+                          "var_share": vs, "var_per_cap": vs / cap,
+                          "res_share": rs, "res_per_cap": rs / cap})
+
+    rank_raw = [d["type"] for d in sorted(var_types,
+                key=lambda d: -d["var_per_cap"])]
+    rank_res = [d["type"] for d in sorted(var_types,
+                key=lambda d: -d["res_per_cap"])]
+
+    out["var"] = {
+        "alpha": 0.95,
+        "var": jsonable(var_f), "es": jsonable(es_f),
+        "es_over_var": jsonable(es_f / var_f if var_f else np.nan),
+        "worst_day": jsonable(-float(r_fund.min())),
+        "nav": a.nav * m,
+        "by_type": var_types,
+        "rank_raw": rank_raw, "rank_res": rank_res,
+        "rankings_disagree": rank_raw != rank_res,
+        "k_factors": int(max(a.factors)),
+    }
+
     out["pairs"] = {}
     out["separation"] = []
     for k in a.factors:
