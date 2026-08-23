@@ -571,6 +571,40 @@ function corr(a,b){
   return (sa>0&&sb>0)? sab/Math.sqrt(sa*sb) : 0;
 }
 
+function thesisOverlap(a, b, ga, gb){
+  // Verbatim port of thesis_overlap() in pods7_thesis_risk.py, so the browser
+  // and the pipeline produce the same number rather than two numbers that
+  // happen to agree.
+  //
+  // IT SCORES FIELDS, NOT PROSE, AND EVERY FIELD CAME OUT OF THE DOCUMENT.
+  // Nothing here uses what a model knows about the companies named - which is
+  // the point. A text-similarity score would call two managers identical for
+  // writing in the same register; this asks whether they are betting on one
+  // cause, in one direction, on roughly one timetable, waiting on the same
+  // events.
+  //
+  // Opposite directions on a shared driver score ZERO on purpose. Those two
+  // are each other's hedge, not each other's crowd, and any similarity metric
+  // built on wording would rank them as the closest pair in the fund.
+  if(!a||!b) return 0;
+  let share=false;
+  if(ga&&gb) ga.forEach(x=>{ if(gb.has(x)) share=true; });
+  if(!share) return 0;
+  if(a.direction!==b.direction) return 0;
+  let sc=0.75;
+  const ha=a.horizon_quarters, hb=b.horizon_quarters;
+  if(typeof ha==="number"&&typeof hb==="number")
+    sc += 0.10*Math.max(0, 1 - Math.abs(ha-hb)/4);
+  const key=c=>String(c&&c.what||"").toLowerCase().slice(0,18);
+  const ca=new Set((a.catalysts||[]).map(key).filter(Boolean));
+  const cb=new Set((b.catalysts||[]).map(key).filter(Boolean));
+  if(ca.size&&cb.size){
+    let inter=0; ca.forEach(x=>{ if(cb.has(x)) inter++; });
+    sc += 0.15*inter/(ca.size+cb.size-inter);
+  }
+  return Math.round(Math.min(sc,1)*1000)/1000;
+}
+
 function blockShift(x, block, rnd){
   // Circular block bootstrap, same as block_shift() in pods2_crowding.py:
   // keeps each series' own dynamics, destroys alignment BETWEEN series.
@@ -1203,7 +1237,8 @@ function Upload(){
           let jac=null;
           if(A&&B){ let n=0; A.forEach(x=>{if(B.has(x)) n++;});
                     jac=n/(A.size+B.size-n); }
-          cells.push({a:p,b:q,shared:same,jac,
+          const tov=thesisOverlap(ext[p], ext[q], gp, gq);
+          cells.push({a:p,b:q,shared:same,jac,tov,
             cell: jac===null ? (same?"latent?":"—")
                  : (same&&jac>=0.05) ? "crowded"
                  : same ? "latent" : (jac>=0.05?"coincidental":"independent")});
@@ -2064,12 +2099,14 @@ FERC queue data, December.`}
           </p>
 
           <table style={{marginTop:16}}>
-            <thead><tr><th>Pair</th><th>Same bet</th><th>Book overlap</th>
+            <thead><tr><th>Pair</th><th className="v">Thesis overlap</th>
+              <th className="v">Book overlap</th>
               <th>Reading</th></tr></thead>
-            <tbody>{tRes.cells.filter(c=>c.shared).slice(0,14).map((c,i)=>(
+            <tbody>{[...tRes.cells].filter(c=>c.shared)
+                .sort((x,y)=>(y.tov||0)-(x.tov||0)).slice(0,14).map((c,i)=>(
               <tr key={i}>
                 <td className="v">{c.a} · {c.b}</td>
-                <td className="v">yes</td>
+                <td className="v">{c.tov!=null?(c.tov*100).toFixed(0)+"%":"—"}</td>
                 <td className="v">{c.jac===null?"no positions loaded":(c.jac*100).toFixed(1)+"%"}</td>
                 <td className={c.cell==="crowded"?"neg":""}>
                   {c.cell==="crowded"?"same bet, same names — someone cuts"
@@ -2081,6 +2118,18 @@ FERC queue data, December.`}
             </tbody>
           </table>
 
+          <p className="note">
+            <strong>Thesis overlap is a measurement, not an impression.</strong>{" "}
+            A pair scores 0 unless the model placed them on one driver in the
+            same direction — same driver in <em>opposite</em> directions is a
+            hedge, and scores zero, though any similarity metric built on
+            wording would rank those two as the closest pair in the fund. From
+            there the score rises with how close their stated horizons are and
+            how many of their catalysts coincide. Every input was pulled out of
+            the documents; nothing comes from what the model knows about the
+            companies named. It is the same function the Python pipeline uses,
+            so the two report one number rather than two that happen to agree.
+          </p>
           <p className="note">
             The reading column is about exits, not about who is wrong.{" "}
             <strong>Same bet, same names</strong> means that when the thesis
@@ -2481,10 +2530,18 @@ function NetGross({data}){
       </table>
       <p className="note">
         {hidden>0
-          ? <>{hidden} of these {w.names.length} names carry a net position under
-             half their gross. A net-exposure report shows them as modest
-             holdings while several managers are each long them and would each
-             sell into the same bid.</>
+          ? <>{hidden} of these {w.names.length} name{hidden===1?"":"s"}{" "}
+             {hidden===1?"carries":"carry"} a net position under half its
+             gross. A net-exposure report shows {hidden===1?"it":"them"} as a
+             modest holding while several managers are each long{" "}
+             {hidden===1?"it":"them"} and would each sell into the same bid.
+             {hidden <= 2 &&
+               <> That is {hidden} name out of {w.names.length}, which is weak
+               evidence for a strong distinction. The two measures only diverge
+               when pods take opposite sides on the same name, and in a universe
+               this wide they rarely do — so the argument for reporting both
+               columns rests on the principle rather than on this simulation
+               demonstrating it.</>}</>
           : <>Net and gross mostly agree here, so a net-exposure report would not
              have missed these names. Worth stating plainly rather than claiming
              otherwise — the two measures only diverge when pods take opposite
