@@ -958,10 +958,10 @@ function Upload(){
 
         // if one manager is forced out, who else is in those names
         const exit=pods.map(p=>{
-          const theirs=rows.filter(r=>r.pod===p&&r.side==="long");
+          const theirs=rows.filter(r=>r.pod===p);
           const set=new Set(theirs.map(r=>r.ticker));
           const hit=pods.filter(q=>q!==p).map(q=>{
-            const ex=rows.filter(r=>r.pod===q&&r.side==="long"&&set.has(r.ticker));
+            const ex=rows.filter(r=>r.pod===q&&set.has(r.ticker));
             return {pod:q, exposed:ex.reduce((a,r)=>a+r.exp,0),
                     names:ex.length};
           }).filter(h=>h.exposed>0).sort((a,b)=>b.exposed-a.exposed);
@@ -1083,8 +1083,8 @@ function Upload(){
                 if(!v||!c) return;
                 const move=-1.0*v/Math.sqrt(252)*Math.sqrt(r.exp/(0.005*c));
                 covered.forEach(q=>{ if(q===p) return;
-                  const o=rows.find(x=>x.pod===q&&x.ticker===r.ticker&&x.side==="long");
-                  if(o) hit+=o.exp*move;
+                  const o=rows.find(x=>x.pod===q&&x.ticker===r.ticker);
+                  if(o) hit+=(o.side==="long"?o.exp:-o.exp)*move;
                 });
               });
               return {pod:p, damage:hit};
@@ -1140,7 +1140,7 @@ function Upload(){
 
         const B=sizes.reduce((a,b)=>a+b,0)/Math.max(pods.length,1);
         setRes({pods:pods.length, uni:uni.length, ladder, pairs, names,
-                mgr, grid, gridNames, exit, ret,
+                mgr, grid, gridNames, allNamesCount: new Set(rows.filter(r=>r.side==="long").map(r=>r.ticker)).size, exit, ret,
                 floor:B*B/Math.max(uni.length,1)/(2*B),
                 inCash,
                 assumed:rows.some(r=>r.assumed)});
@@ -1479,7 +1479,7 @@ FERC queue data, December.`}
 
           <h2 style={{fontSize:"15px",marginTop:20}}>Who is in which name</h2>
           <p className="note" style={{marginTop:2}}>
-            The most-pressured names against every manager. Filled square is
+            The {res.gridNames.length} most-pressured long names, plus each manager's largest where none of theirs made the cut, out of {res.allNamesCount} long names held. Filled square is
             long, hollow is short, blank is not held. No test and no null —
             just the books side by side, which is the raw fact everything else
             on this page summarises.
@@ -1731,7 +1731,7 @@ FERC queue data, December.`}
                 </tbody>
               </table>
               <p className="note">
-                Square-root impact on each name's own realised volatility, with
+                Square-root impact on each name's own realised volatility, at an impact coefficient of 1.0 and with
                 capacity proxied at 0.5% of market capitalisation a day because
                 CRSP carries no volume. The ordering is the result; the dollar
                 figures move with that liquidity assumption and are a scenario
@@ -1742,14 +1742,14 @@ FERC queue data, December.`}
           <h2 style={{fontSize:"15px",marginTop:20}}>If one manager is forced out</h2>
           <p className="note" style={{marginTop:2}}>
             A stop-loss is automatic and nobody votes on it. If a manager is
-            liquidated, every other manager long the same names is marked at
+            liquidated, every other manager holding the same names, either side, is marked at
             whatever that selling does to the price. This ranks who would be
             selling into whom. It is exposure at risk, not a loss estimate —
             turning it into a number needs each name's volatility and a
             liquidity proxy, which a position file does not carry.
           </p>
           <table>
-            <thead><tr><th>If this manager is liquidated</th><th>They sell</th>
+            <thead><tr><th>If this manager is liquidated</th><th>They trade</th>
               <th>Others exposed to the same names</th><th>Managers hit</th></tr></thead>
             <tbody>{res.exit.map(e=>{
               const f=v=>res.inCash?(v/1e6).toFixed(1)+"m":v.toFixed(2);
